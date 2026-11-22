@@ -11,7 +11,8 @@ Flow (design chapter 3):
     [5] isolated items    drop items that appear in no KG triple (head or tail)
         repeat [3]-[5] until a round removes no interaction in [4] or [5]
     [6] split             per user: test = max(1, R(0.2 n)), valid = max(1, R(0.1 n)), rest train
-    [7] IDs, [8] write    (not yet)
+    [7] assign IDs        0-based, by sorted original ID; items then aux share node_idx
+    [8] write             (not yet)
 
 Standard library only (Python 3.10+).
 """
@@ -70,6 +71,25 @@ class State:
     optional_keys: tuple   # timestamp / rating present in the input
     stats: dict = field(default_factory=dict)
     split: dict = None     # user_id -> {"train": [item_id], "valid": [...], "test": [...]}
+    ids: "Ids" = None
+
+
+@dataclass
+class Ids:
+    """Design 7: *_idx are 0-based numbers in sorted order of the original ID strings
+    (Unicode code points). Items and aux share one node space, items first."""
+    user: dict       # user_id -> user_idx
+    item: dict       # item_id -> item_idx (= node_idx)
+    aux: dict        # aux_id -> aux_idx
+    relation: dict   # relation -> rel_idx
+
+    @property
+    def n_items(self) -> int:
+        return len(self.item)
+
+    def node(self, node_type: str, node_id: str) -> int:
+        """node_idx of an item or aux."""
+        return self.item[node_id] if node_type == "item" else self.n_items + self.aux[node_id]
 
 
 # ---------------------------------------------------------------- [1] validate
@@ -256,6 +276,25 @@ def split_users(state: State, seed: int, split) -> dict:
     return counts
 
 
+# ---------------------------------------------------------------- [7] IDs
+
+def numbering(ids) -> dict:
+    return {x: k for k, x in enumerate(sorted(ids))}
+
+
+def assign_ids(state: State) -> Ids:
+    state.ids = Ids(
+        user=numbering({u for u, _ in state.pairs}),
+        item=numbering(state.items),
+        aux=numbering(state.auxs),
+        relation=numbering(state.relations),
+    )
+    n_items, n_aux = len(state.ids.item), len(state.ids.aux)
+    print(f"[7] ID 부여: 사용자 {len(state.ids.user):,}, 아이템 {n_items:,} (node 0~{n_items - 1}), "
+          f"aux {n_aux:,} (node {n_items}~{n_items + n_aux - 1}), 관계 {len(state.ids.relation):,}")
+    return state.ids
+
+
 # ---------------------------------------------------------------- driver
 
 def preprocess(config: Config) -> State:
@@ -264,6 +303,7 @@ def preprocess(config: Config) -> State:
     state = merge_duplicates(data)
     run_filters(state, config.user_min_interactions, config.item_min_interactions)
     split_users(state, config.seed, config.split)
+    assign_ids(state)
     return state
 
 

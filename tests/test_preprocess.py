@@ -252,6 +252,32 @@ def test_split_users_is_independent_of_other_users(tmp_path):
     assert state.stats["split_pairs"] == {"train": 5, "valid": 1, "test": 1}
 
 
+# ---------------------------------------------------------------- [7] IDs
+
+def test_numbering_uses_code_point_order():
+    assert pp.numbering({"2", "10", "b", "B", "가", "_x"}) == {"10": 0, "2": 1, "B": 2, "_x": 3, "b": 4, "가": 5}
+
+
+def test_assign_ids(tmp_path):
+    state = merged(tmp_path)
+    ids = pp.assign_ids(state)
+    assert ids.user == {"U1": 0, "U2": 1}
+    assert ids.item == {"I1": 0, "I2": 1, "I3": 2}
+    assert ids.aux == {"A1": 0, "A2": 1}
+    assert ids.relation == {"author": 0, "sequel": 1}
+    assert [ids.node("item", i) for i in ("I1", "I2", "I3")] == [0, 1, 2]
+    assert [ids.node("aux", a) for a in ("A1", "A2")] == [3, 4]          # aux come after the items
+
+
+def test_ids_do_not_depend_on_input_order(tmp_path):
+    a = merged(tmp_path / "a")
+    rev = lambda text: text.split("\n", 1)[0] + "\n" + "\n".join(reversed(text.split("\n", 1)[1].strip().split("\n"))) + "\n"
+    b = merged(tmp_path / "b", items__csv=rev(VALID["items.csv"]), auxs__csv=rev(VALID["auxs.csv"]),
+               relations__csv=rev(VALID["relations.csv"]), kg__csv=rev(VALID["kg.csv"]),
+               interactions__jsonl=list(reversed(VALID["interactions.jsonl"])))
+    assert pp.assign_ids(a) == pp.assign_ids(b)
+
+
 # ---------------------------------------------------------------- real data
 
 def domain_or_skip(name):
@@ -276,4 +302,7 @@ def test_noisy_book_cleans_to_book():
     assert book.stats["filter_rounds"] == noisy.stats["filter_rounds"] == 1
     assert "isolated_items_removed" not in noisy.stats
     assert book.split == noisy.split
+    assert book.ids == noisy.ids
+    assert (len(book.ids.user), book.ids.n_items, len(book.ids.aux), len(book.ids.relation)) == (14_946, 8_475, 23_330, 20)
+    assert book.ids.node("aux", max(book.ids.aux, key=book.ids.aux.get)) == 31_804
     assert book.stats["split_pairs"] == {"train": 115_376, "valid": 20_686, "test": 33_211}   # 68.2 / 12.2 / 19.6
