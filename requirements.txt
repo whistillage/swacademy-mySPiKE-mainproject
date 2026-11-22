@@ -1,0 +1,3 @@
+# validate_dataset.py, preprocess.py and tools/ use only the Python standard library (3.10+).
+# Test dependency:
+pytest>=8

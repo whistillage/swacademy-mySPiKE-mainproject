@@ -1,0 +1,19 @@
+# Project data: raw submissions, prep outputs, profiles (see docs/SPiKE_데이터_디렉토리_규약.pdf)
+/data/
+
+# Paper PDF: not redistributed in this public repo
+/docs/SPiKE.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
