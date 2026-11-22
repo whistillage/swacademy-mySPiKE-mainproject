@@ -29,6 +29,9 @@ mySPiKE/
 ```bash
 # 저자 book 데이터 -> 명세 형식 5개 파일 (data/book/raw/)
 python tools/convert_book.py ../SPiKE/spike/datasets/kg/amazon-book_kg data/book/raw
+
+# 일부러 참고 조건을 어긴 시험용 데이터 (data/book_noisy/raw/ + noisy_manifest.json)
+python tools/make_noisy_book.py data/book/raw data/book_noisy
 ```
 
 ## 문서 (`docs/`)
