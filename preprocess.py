@@ -6,7 +6,9 @@
 Flow (design chapter 3):
     [1] validate          validate_dataset.validate(); stop on ERROR
     [2] merge duplicates  one entry per (user, item); KG exact duplicates collapse
-    [3]-[5] filters       (not yet)
+    [3] user filter       drop users with < user_min distinct items
+    [4] item filter       drop items with < item_min users, then clean the KG (4 steps)
+    [5] isolated items, repeat [3]-[5]   (not yet)
     [6] split, [7] IDs, [8] write   (not yet)
 
 Standard library only (Python 3.10+).
@@ -113,12 +115,81 @@ def merge_duplicates(data: vd.Dataset) -> State:
     return state
 
 
+# ---------------------------------------------------------------- [3] / [4] filters
+
+def add_stat(state: State, key: str, n: int):
+    state.stats[key] = state.stats.get(key, 0) + n
+
+
+def filter_users(state: State, user_min: int) -> int:
+    """Design 5.3: drop users with fewer than user_min distinct items (pairs are already merged)."""
+    per_user = {}
+    for u, _ in state.pairs:
+        per_user[u] = per_user.get(u, 0) + 1
+    removed = {u for u, n in per_user.items() if n < user_min}
+    before = len(state.pairs)
+    state.pairs = {k: v for k, v in state.pairs.items() if k[0] not in removed}
+    add_stat(state, "users_removed", len(removed))
+    add_stat(state, "pairs_removed", before - len(state.pairs))
+    return len(removed)
+
+
+def remove_items(state: State, removed: set):
+    """Remove items (and their pairs), then clean the KG (design 5.4):
+    1. triples that contain a removed item
+    2. aux no longer linked to a remaining item (tail of item -> aux)
+    3. triples that contain an aux removed in 2 (aux -> aux)
+    4. relations without triples
+    """
+    if not removed:
+        return
+    before_pairs, before_kg = len(state.pairs), len(state.kg)
+    for i in removed:
+        del state.items[i]
+    state.pairs = {k: v for k, v in state.pairs.items() if k[1] not in removed}
+
+    def has_removed_item(t):
+        return (t[0] == "item" and t[1] in removed) or (t[3] == "item" and t[4] in removed)
+    state.kg = {t for t in state.kg if not has_removed_item(t)}                       # 1
+    linked = {t[4] for t in state.kg if t[0] == "item" and t[3] == "aux"}
+    dead_aux = set(state.auxs) - linked                                                # 2
+    for a in dead_aux:
+        del state.auxs[a]
+    state.kg = {t for t in state.kg
+                if not ((t[0] == "aux" and t[1] in dead_aux) or (t[3] == "aux" and t[4] in dead_aux))}  # 3
+    used = {t[2] for t in state.kg}
+    dead_rel = set(state.relations) - used                                             # 4
+    for r in dead_rel:
+        del state.relations[r]
+
+    add_stat(state, "items_removed", len(removed))
+    add_stat(state, "pairs_removed", before_pairs - len(state.pairs))
+    add_stat(state, "aux_removed", len(dead_aux))
+    add_stat(state, "kg_triples_removed", before_kg - len(state.kg))
+    add_stat(state, "relations_removed", len(dead_rel))
+
+
+def filter_items(state: State, item_min: int) -> int:
+    """Design 5.4: drop items with fewer than item_min users (default 1: no interactions)."""
+    per_item = dict.fromkeys(state.items, 0)
+    for _, i in state.pairs:
+        per_item[i] += 1
+    removed = {i for i, n in per_item.items() if n < item_min}
+    remove_items(state, removed)
+    return len(removed)
+
+
 # ---------------------------------------------------------------- driver
 
 def preprocess(config: Config) -> State:
     config.check()
     data = run_validation(config.raw_dir)
     state = merge_duplicates(data)
+    users = filter_users(state, config.user_min_interactions)
+    print(f"[3] 사용자 필터: {users:,}명 제거 → 사용자 {len({u for u, _ in state.pairs}):,}명, {len(state.pairs):,}쌍")
+    items = filter_items(state, config.item_min_interactions)
+    print(f"[4] 아이템 필터: {items:,}개 제거 → 아이템 {len(state.items):,}, aux {len(state.auxs):,}, "
+          f"관계 {len(state.relations):,}, KG {len(state.kg):,}")
     return state
 
 
