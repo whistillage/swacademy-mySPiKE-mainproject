@@ -10,14 +10,18 @@ Flow (design chapter 3):
     [4] item filter       drop items with < item_min users, then clean the KG (4 steps)
     [5] isolated items    drop items that appear in no KG triple (head or tail)
         repeat [3]-[5] until a round removes no interaction in [4] or [5]
-    [6] split, [7] IDs, [8] write   (not yet)
+    [6] split             per user: test = max(1, R(0.2 n)), valid = max(1, R(0.1 n)), rest train
+    [7] IDs, [8] write    (not yet)
 
 Standard library only (Python 3.10+).
 """
 
 import argparse
+import math
+import random
 import sys
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 import validate_dataset as vd
@@ -47,8 +51,10 @@ class Config:
     def check(self):
         if len(self.split) != 3 or any(not 0 < x < 1 for x in self.split) or abs(sum(self.split) - 1) > 1e-9:
             raise ValueError(f"split must be three ratios in (0, 1) summing to 1: {self.split}")
-        if self.user_min_interactions < 1 or self.item_min_interactions < 1:
-            raise ValueError("minimum interaction counts must be >= 1")
+        if self.user_min_interactions < 3:
+            raise ValueError("user_min_interactions must be >= 3 (train / valid / test need one each)")
+        if self.item_min_interactions < 1:
+            raise ValueError("item_min_interactions must be >= 1")
 
 
 # ---------------------------------------------------------------- working state
@@ -63,6 +69,7 @@ class State:
     kg: set                # {(head_type, head, relation, tail_type, tail)}, exact duplicates removed
     optional_keys: tuple   # timestamp / rating present in the input
     stats: dict = field(default_factory=dict)
+    split: dict = None     # user_id -> {"train": [item_id], "valid": [...], "test": [...]}
 
 
 # ---------------------------------------------------------------- [1] validate
@@ -209,6 +216,46 @@ def run_filters(state: State, user_min: int, item_min: int) -> int:
     return rounds
 
 
+# ---------------------------------------------------------------- [6] split
+
+def half_up(x: Fraction) -> int:
+    """Round half up (0.5 -> 1). Python's round() rounds half to even."""
+    return math.floor(x + Fraction(1, 2))
+
+
+def split_counts(n: int, split) -> tuple:
+    """Design 6.1: (train, valid, test) for a user with n items. Ratios are used as exact
+    fractions (0.1 * 15 is 1.5000000000000002 in floating point)."""
+    _, p_valid, p_test = (Fraction(str(x)) for x in split)
+    test = max(1, half_up(p_test * n))
+    valid = max(1, half_up(p_valid * n))
+    train = n - test - valid
+    if train < 1:
+        raise ValueError(f"split {tuple(split)} leaves no train item for a user with {n} items")
+    return train, valid, test
+
+
+def split_user(user_id: str, items, seed: int, split) -> dict:
+    """Sort the user's items by item_id, shuffle with the user's own generator seeded by
+    "<seed>:<user_id>", then take test, valid, and the rest as train (design 6.1)."""
+    order = sorted(items)
+    random.Random(f"{seed}:{user_id}").shuffle(order)
+    _, valid, test = split_counts(len(order), split)
+    return {"test": order[:test], "valid": order[test:test + valid], "train": order[test + valid:]}
+
+
+def split_users(state: State, seed: int, split) -> dict:
+    per_user = {}
+    for u, i in state.pairs:
+        per_user.setdefault(u, []).append(i)
+    state.split = {u: split_user(u, items, seed, split) for u, items in per_user.items()}
+    counts = {part: sum(len(s[part]) for s in state.split.values()) for part in ("train", "valid", "test")}
+    state.stats["split_pairs"] = counts
+    total = sum(counts.values()) or 1
+    print("[6] 분할: " + ", ".join(f"{k} {v:,} ({v / total:.1%})" for k, v in counts.items()))
+    return counts
+
+
 # ---------------------------------------------------------------- driver
 
 def preprocess(config: Config) -> State:
@@ -216,6 +263,7 @@ def preprocess(config: Config) -> State:
     data = run_validation(config.raw_dir)
     state = merge_duplicates(data)
     run_filters(state, config.user_min_interactions, config.item_min_interactions)
+    split_users(state, config.seed, config.split)
     return state
 
 

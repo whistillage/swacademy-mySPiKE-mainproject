@@ -37,6 +37,12 @@ def test_bad_split_is_rejected(tmp_path, split):
         config(tmp_path, split=split).check()
 
 
+@pytest.mark.parametrize("user_min", [0, 1, 2])
+def test_user_min_below_three_is_rejected(tmp_path, user_min):
+    with pytest.raises(ValueError):
+        config(tmp_path, user_min_interactions=user_min).check()
+
+
 def test_cli_parses_options():
     c = pp.parse_args(["data/x", "--version", "v2", "--seed", "7", "--split", "0.8", "0.1", "0.1",
                        "--user-min", "3", "--item-min", "2"])
@@ -204,6 +210,48 @@ def test_item_only_as_tail_is_not_isolated(tmp_path):
     assert "I4" in state.items
 
 
+# ---------------------------------------------------------------- [6] split
+
+@pytest.mark.parametrize("n, expected", [
+    (3, (1, 1, 1)), (5, (3, 1, 1)), (6, (4, 1, 1)), (7, (5, 1, 1)), (10, (7, 1, 2)), (20, (14, 2, 4)),
+    (15, (10, 2, 3)),     # valid: 0.1 * 15 = 1.5 -> 2 (half up), test: 3
+    (25, (17, 3, 5)),     # valid: 2.5 -> 3 (round() would give 2)
+])
+def test_split_counts(n, expected):
+    assert pp.split_counts(n, (0.7, 0.1, 0.2)) == expected
+
+
+def test_split_counts_without_train_item_is_an_error():
+    with pytest.raises(ValueError):
+        pp.split_counts(3, (0.1, 0.1, 0.8))
+
+
+def test_split_user_assigns_every_item_once():
+    items = [f"I{k:02d}" for k in range(20)]
+    s = pp.split_user("U1", items, 2020, (0.7, 0.1, 0.2))
+    assert (len(s["train"]), len(s["valid"]), len(s["test"])) == (14, 2, 4)
+    assert sorted(s["train"] + s["valid"] + s["test"]) == items
+
+
+def test_split_user_ignores_item_order_and_other_users():
+    items = [f"I{k:02d}" for k in range(10)]
+    a = pp.split_user("U1", items, 2020, (0.7, 0.1, 0.2))
+    assert pp.split_user("U1", list(reversed(items)), 2020, (0.7, 0.1, 0.2)) == a
+    assert pp.split_user("U2", items, 2020, (0.7, 0.1, 0.2)) != a       # each user has its own shuffle
+    assert pp.split_user("U1", items, 7, (0.7, 0.1, 0.2)) != a          # and the seed matters
+
+
+def test_split_users_is_independent_of_other_users(tmp_path):
+    state = merged(tmp_path)
+    state.pairs = {(u, f"I{k}"): {} for u in ("U1", "U2") for k in range(1, 8)}
+    pp.split_users(state, 2020, (0.7, 0.1, 0.2))
+    with_u2 = state.split["U1"]
+    state.pairs = {k: v for k, v in state.pairs.items() if k[0] == "U1"}
+    pp.split_users(state, 2020, (0.7, 0.1, 0.2))
+    assert state.split["U1"] == with_u2
+    assert state.stats["split_pairs"] == {"train": 5, "valid": 1, "test": 1}
+
+
 # ---------------------------------------------------------------- real data
 
 def domain_or_skip(name):
@@ -227,3 +275,5 @@ def test_noisy_book_cleans_to_book():
     assert noisy.stats["users_removed"] == 400 and noisy.stats["items_removed"] == 271
     assert book.stats["filter_rounds"] == noisy.stats["filter_rounds"] == 1
     assert "isolated_items_removed" not in noisy.stats
+    assert book.split == noisy.split
+    assert book.stats["split_pairs"] == {"train": 115_376, "valid": 20_686, "test": 33_211}   # 68.2 / 12.2 / 19.6
