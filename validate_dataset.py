@@ -61,6 +61,14 @@ MESSAGES = {
     "E_REL_AUX_ITEM": (ERROR, "aux → item 관계는 선언할 수 없습니다 (방향을 item → aux로)"),
     "E_PLACEHOLDER_MISSING": (ERROR, "템플릿에 필수 자리표시자가 없습니다 (sentence: {head} {tails}, reverse_sentence: {tail} {head})"),
     "E_PLACEHOLDER_UNKNOWN": (ERROR, "템플릿에 허용되지 않은 중괄호 표현이 있습니다 ({head} {tail} {tails}만 사용)"),
+    "E_KG_TYPE": (ERROR, "head_type/tail_type은 item 또는 aux여야 합니다"),
+    "E_KG_REF": (ERROR, "목록에 없는 head/tail/relation입니다 (items.csv, auxs.csv, relations.csv)"),
+    "E_KG_AUX_ITEM": (ERROR, "aux → item 트리플은 넣을 수 없습니다 (방향을 item → aux로)"),
+    "E_KG_SELF": (ERROR, "자기 자신을 가리키는 트리플입니다"),
+    "E_KG_REL_TYPE": (ERROR, "관계를 relations.csv에 선언한 타입 조합과 다르게 썼습니다"),
+    "E_KG_REVERSE": (ERROR, "같은 관계의 역방향 트리플이 있습니다 (역방향은 모델이 자동으로 만듭니다)"),
+    "E_ITEM_NO_TRIPLE": (ERROR, "kg.csv의 어떤 트리플에도 나오지 않는 아이템입니다"),
+    "E_AUX_NOT_LINKED": (ERROR, "아이템과 직접 연결되지 않은 aux입니다 (item → aux 트리플의 tail로 나와야 함)"),
     "W_ID_WHITESPACE": (WARNING, "앞뒤에 공백이 있는 ID가 있습니다 (지운 뒤 처리됩니다)"),
     "W_BLANK_LINE": (WARNING, "빈 줄이 있습니다 (건너뜁니다)"),
     "I_SKIPPED": (INFO, "앞의 에러 때문에 검사를 건너뛰었습니다"),
@@ -138,6 +146,11 @@ class Dataset:
     kg: list = None
     relations: list = None
     optional_keys: tuple = ()   # optional interaction keys present in the file
+    # filled by the checks (input for the warnings and for preprocessing)
+    relation_types: dict = None  # relation -> (head_type, tail_type), valid declarations only
+    kg_rows: list = None         # format-valid kg rows as (triple, line), duplicates included
+    kg_triples: dict = None      # triple -> first line; deduped, structurally valid
+                                 # triple = (head_type, head, relation, tail_type, tail)
 
 
 def is_empty(value) -> bool:
@@ -304,13 +317,19 @@ def check_relations(data: Dataset, report: Report):
     if data.relations is None:
         return
     check_unique(data.relations, name, "relation", "E_DUP_RELATION", report)
+    data.relation_types = {}
+    declared = set()
     for r in data.relations:
         where = f"{name}:{r['_line']} {r['relation']}"
         types = (r["head_type"].strip(), r["tail_type"].strip())
+        first = r["relation"] not in declared
+        declared.add(r["relation"])
         if any(t not in NODE_TYPES for t in types):
             report.add("E_REL_TYPE", name, f"{where} ({types[0]} → {types[1]})")
         elif types == ("aux", "item"):
             report.add("E_REL_AUX_ITEM", name, where)
+        elif first:
+            data.relation_types[r["relation"]] = types
         for col, required in REQUIRED_PLACEHOLDERS.items():
             template = r[col]
             found = re.findall(r"\{([^{}]*)\}", template)
@@ -324,6 +343,98 @@ def check_relations(data: Dataset, report: Report):
                 report.add("E_PLACEHOLDER_UNKNOWN", name, f"{where} {col}: {template!r}")
 
 
+def check_kg(data: Dataset, report: Report):
+    """KG format, then structure on deduped triples. Order matters (one report per cause):
+    1. format (E_KG_TYPE, E_KG_REF)            failing rows are dropped; rows using a relation
+                                                whose declaration is invalid are dropped silently
+    2. dedupe                                   exact duplicates -> one triple (warning in W_*)
+    3. per triple, first match only             E_KG_AUX_ITEM > E_KG_SELF > E_KG_REL_TYPE; dropped
+    4. pairs (E_KG_REVERSE)                     one report per pair; triples are kept
+    Survivors go to data.kg_triples, used by the link checks and the warnings.
+    """
+    name = "kg.csv"
+    if data.kg is None:
+        return
+    needed = {"items.csv": data.items, "auxs.csv": data.auxs, "relations.csv": data.relations}
+    missing = [n for n, rows in needed.items() if rows is None]
+    if missing:
+        skipped(report, name, "KG 참조·구조 검사", ", ".join(missing))
+        return
+
+    nodes = {"item": {r["item_id"] for r in data.items}, "aux": {r["aux_id"] for r in data.auxs}}
+    known_relations = {r["relation"] for r in data.relations}
+
+    # 1. format
+    data.kg_rows = []
+    for r in data.kg:
+        where = f"{name}:{r['_line']}"
+        ht, tt = r["head_type"].strip(), r["tail_type"].strip()
+        if ht not in NODE_TYPES or tt not in NODE_TYPES:
+            report.add("E_KG_TYPE", name, f"{where} ({r['head_type']} → {r['tail_type']})")
+            continue
+        bad = [f"{col}={r[col]!r}" for col, typ in (("head", ht), ("tail", tt)) if r[col] not in nodes[typ]]
+        if r["relation"] not in known_relations:
+            bad.append(f"relation={r['relation']!r}")
+        if bad:
+            report.add("E_KG_REF", name, f"{where} " + ", ".join(bad))
+            continue
+        if r["relation"] not in data.relation_types:
+            continue   # invalid declaration, reported for relations.csv
+        data.kg_rows.append(((ht, r["head"], r["relation"], tt, r["tail"]), r["_line"]))
+
+    # 2. dedupe
+    unique = {}
+    for triple, line in data.kg_rows:
+        unique.setdefault(triple, line)
+
+    # 3. per-triple structure
+    data.kg_triples = {}
+    for triple, line in unique.items():
+        ht, h, rel, tt, t = triple
+        where = f"{name}:{line} {h} --{rel}--> {t}"
+        if (ht, tt) == ("aux", "item"):
+            report.add("E_KG_AUX_ITEM", name, where)
+        elif ht == tt and h == t:
+            report.add("E_KG_SELF", name, where)
+        elif data.relation_types[rel] != (ht, tt):
+            decl = data.relation_types[rel]
+            report.add("E_KG_REL_TYPE", name, f"{where} (사용: {ht} → {tt}, 선언: {decl[0]} → {decl[1]})")
+        else:
+            data.kg_triples[triple] = line
+
+    # 4. reverse pairs (same relation), reported once per pair
+    for triple, line in data.kg_triples.items():
+        ht, h, rel, tt, t = triple
+        rev = (tt, t, rel, ht, h)
+        if rev in data.kg_triples and (h, t) < (t, h):
+            report.add("E_KG_REVERSE", name,
+                       f"{name}:{line} {h} --{rel}--> {t} / {name}:{data.kg_triples[rev]} {t} --{rel}--> {h}")
+
+
+def check_links(data: Dataset, report: Report):
+    """Every item appears in a triple (head or tail); every aux is the tail of an item -> aux triple."""
+    if data.kg_triples is None:
+        for file in ("items.csv", "auxs.csv"):
+            if getattr(data, file.split(".")[0]) is not None:
+                skipped(report, file, "KG 등장·연결 검사", "kg.csv (또는 KG 검사에 필요한 파일)")
+        return
+    in_kg = set()
+    linked_aux = set()
+    for ht, h, _, tt, t in data.kg_triples:
+        if ht == "item":
+            in_kg.add(h)
+        if tt == "item":
+            in_kg.add(t)
+        if ht == "item" and tt == "aux":
+            linked_aux.add(t)
+    for r in data.items:
+        if r["item_id"] not in in_kg:
+            report.add("E_ITEM_NO_TRIPLE", "items.csv", f"items.csv:{r['_line']} item_id={r['item_id']!r}")
+    for r in data.auxs:
+        if r["aux_id"] not in linked_aux:
+            report.add("E_AUX_NOT_LINKED", "auxs.csv", f"auxs.csv:{r['_line']} aux_id={r['aux_id']!r}")
+
+
 def validate(raw_dir, max_examples: int = 5):
     """Run all checks. Returns (Report, Dataset)."""
     raw = Path(raw_dir)
@@ -333,6 +444,8 @@ def validate(raw_dir, max_examples: int = 5):
     check_unique(data.items, "items.csv", "item_id", "E_DUP_ITEM", report)
     check_unique(data.auxs, "auxs.csv", "aux_id", "E_DUP_AUX", report)
     check_relations(data, report)
+    check_kg(data, report)
+    check_links(data, report)
     return report, data
 
 

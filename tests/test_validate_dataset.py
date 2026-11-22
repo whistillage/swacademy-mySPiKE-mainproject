@@ -221,10 +221,101 @@ def test_relation_errors(tmp_path, extra, code):
 # ---------------------------------------------------------------- real data
 
 @pytest.mark.parametrize("domain", ["book", "book_noisy"])
-def test_real_data_has_no_format_errors(domain):
+def test_real_data_has_no_errors(domain):
     raw = ROOT / "data" / domain / "raw"
     if not (raw / "interactions.jsonl").exists():
         pytest.skip(f"{raw} not generated")
     report, data = vd.validate(raw)
     assert report.by_level(vd.ERROR) == []
     assert len(data.items) == {"book": 8_696, "book_noisy": 8_746}[domain]
+    assert len(data.kg_rows) == {"book": 69_573, "book_noisy": 70_082}[domain]
+    assert len(data.kg_triples) == {"book": 66_825, "book_noisy": 67_014}[domain]
+
+
+# ---------------------------------------------------------------- kg
+
+KG_HEADER = "head_type,head,relation,tail_type,tail\n"
+KG_OK = VALID["kg.csv"]
+
+
+@pytest.mark.parametrize("extra, code", [
+    ("item,I1,author,person,A1\n", "E_KG_TYPE"),
+    ("item,I1,author,aux,NOPE\n", "E_KG_REF"),
+    ("item,NOPE,author,aux,A1\n", "E_KG_REF"),
+    ("item,I1,unknown,aux,A1\n", "E_KG_REF"),
+    ("aux,A1,author,item,I3\n", "E_KG_AUX_ITEM"),
+    ("item,I3,sequel,item,I3\n", "E_KG_SELF"),
+    ("item,I3,author,item,I1\n", "E_KG_REL_TYPE"),
+    ("item,I2,sequel,item,I1\n", "E_KG_REVERSE"),
+])
+def test_kg_errors(tmp_path, extra, code):
+    report, _ = run(tmp_path, kg__csv=KG_OK + extra)
+    assert report.codes(vd.ERROR) == {code}
+
+
+def test_item_without_triple(tmp_path):
+    report, _ = run(tmp_path, items__csv=VALID["items.csv"] + "I4,Book Four\n")
+    assert report.codes(vd.ERROR) == {"E_ITEM_NO_TRIPLE"}
+
+
+def test_item_only_as_tail_is_fine(tmp_path):
+    """I4 has no outgoing triple but is the tail of item -> item: allowed."""
+    report, _ = run(tmp_path, items__csv=VALID["items.csv"] + "I4,Book Four\n",
+                    kg__csv=KG_OK + "item,I3,sequel,item,I4\n")
+    assert report.issues == {}
+
+
+def test_aux_not_linked(tmp_path):
+    report, _ = run(tmp_path, auxs__csv=VALID["auxs.csv"] + "A3,Lonely,person\n")
+    assert report.codes(vd.ERROR) == {"E_AUX_NOT_LINKED"}
+
+
+def test_aux_linked_only_via_aux_aux_is_error(tmp_path):
+    rel = REL_OK + "related,aux,aux,{head} is related to {tails},{tail} is related to {head}\n"
+    report, _ = run(tmp_path, auxs__csv=VALID["auxs.csv"] + "A3,Country,place\n",
+                    relations__csv=rel, kg__csv=KG_OK + "aux,A1,related,aux,A3\n")
+    assert report.codes(vd.ERROR) == {"E_AUX_NOT_LINKED"}
+
+
+def test_aux_aux_between_linked_aux_is_fine(tmp_path):
+    rel = REL_OK + "related,aux,aux,{head} is related to {tails},{tail} is related to {head}\n"
+    report, data = run(tmp_path, relations__csv=rel, kg__csv=KG_OK + "aux,A1,related,aux,A2\n")
+    assert report.issues == {}
+    assert ("aux", "A1", "related", "aux", "A2") in data.kg_triples
+
+
+# ---------------------------------------------------------------- kg: one report per cause
+
+def test_aux_item_triple_reports_only_aux_item(tmp_path):
+    """Not also E_KG_REL_TYPE (author is declared item -> aux)."""
+    report, _ = run(tmp_path, kg__csv=KG_OK + "aux,A2,author,item,I1\n")
+    assert report.codes(vd.ERROR) == {"E_KG_AUX_ITEM"}
+
+
+def test_invalid_relation_declaration_does_not_cascade(tmp_path):
+    rel = REL_OK + "wrote,aux,item,{head} wrote {tails},{tail} was written by {head}\n"
+    report, _ = run(tmp_path, relations__csv=rel, kg__csv=KG_OK + "aux,A1,wrote,item,I3\n")
+    assert report.codes(vd.ERROR) == {"E_REL_AUX_ITEM"}
+
+
+def test_reverse_pair_reported_once_and_duplicates_collapse(tmp_path):
+    kg = KG_OK + "item,I2,sequel,item,I1\n" * 3 + "item,I1,sequel,item,I2\n"
+    report, data = run(tmp_path, kg__csv=kg)
+    assert report.codes(vd.ERROR) == {"E_KG_REVERSE"}
+    assert report.issues[("E_KG_REVERSE", "kg.csv")].count == 1
+    assert len(data.kg_rows) == 4 + 4                     # duplicates kept for the 2-2c warning
+    assert len(data.kg_triples) == 5                       # deduped
+
+
+def test_bad_reference_does_not_count_as_link(tmp_path):
+    """A1's only triple has a typo in the head -> E_KG_REF, and A2 is no longer linked."""
+    kg = KG_HEADER + "item,I1,author,aux,A1\nitem,I2,author,aux,A1\nitem,I3x,author,aux,A2\nitem,I1,sequel,item,I3\n"
+    report, _ = run(tmp_path, kg__csv=kg)
+    assert report.codes(vd.ERROR) == {"E_KG_REF", "E_AUX_NOT_LINKED"}
+
+
+def test_kg_checks_skipped_without_items(tmp_path):
+    report, _ = run(tmp_path, items__csv=None)
+    skipped_files = {i.file for i in report.by_level(vd.INFO)}
+    assert {"kg.csv", "auxs.csv"} <= skipped_files
+    assert not report.codes(vd.ERROR) - {"E_FILE_MISSING"}
