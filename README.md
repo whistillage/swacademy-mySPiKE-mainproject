@@ -30,6 +30,9 @@ mySPiKE/
 # 제출 데이터 검증 (에러가 있으면 종료 코드 1)
 python validate_dataset.py data/<domain>/raw [--json report.json]
 
+# 전처리 (내부에서 검증을 다시 실행, 에러가 있으면 중단)
+python preprocess.py data/<domain> --version v1
+
 # 저자 book 데이터 -> 명세 형식 5개 파일 (data/book/raw/)
 python tools/convert_book.py ../SPiKE/spike/datasets/kg/amazon-book_kg data/book/raw
 
