@@ -163,6 +163,47 @@ def test_item_min_above_one_also_removes_pairs(tmp_path):
     assert state.stats["pairs_removed"] == 3
 
 
+# ---------------------------------------------------------------- [5] isolated items + repeat
+
+def cascade_domain(tmp_path):
+    """Round 1: I9 has no users -> removed with I5 -sequel-> I9 -> I5 is isolated -> removed
+    with (U1, I5) -> U1 drops to 4 items.  Round 2: U1 removed -> I7 (only U1) removed.
+    No interaction is removed in round 2's [4]/[5] -> stop after 2 rounds."""
+    items = "item_id,name\n" + "".join(f"I{k},Book {k}\n" for k in (1, 2, 3, 4, 5, 6, 7, 9))
+    kg = ("head_type,head,relation,tail_type,tail\n"
+          + "".join(f"item,I{k},author,aux,A1\n" for k in (1, 2, 3, 4, 6, 7))
+          + "item,I5,sequel,item,I9\n")
+    rows = [row("U1", f"I{k}") for k in (1, 2, 3, 5, 7)] + [row("U2", f"I{k}") for k in (1, 2, 3, 4, 6)]
+    return make_domain(tmp_path, items__csv=items, auxs__csv="aux_id,name,aux_type\nA1,Author One,person\n",
+                       kg__csv=kg, interactions__jsonl=rows)
+
+
+def test_filters_repeat_until_nothing_changes(tmp_path):
+    state = pp.preprocess(config(cascade_domain(tmp_path)))
+    assert set(state.items) == {"I1", "I2", "I3", "I4", "I6"}
+    assert {u for u, _ in state.pairs} == {"U2"}
+    assert set(state.relations) == {"author"}           # sequel lost its only triple in round 1
+    assert state.stats["filter_rounds"] == 2
+    assert state.stats["isolated_items_removed"] == 1   # I5
+    assert state.stats["items_removed"] == 2            # I9 (round 1), I7 (round 2)
+    assert state.stats["users_removed"] == 1            # U1 (round 2)
+    assert state.stats["pairs_removed"] == 5            # (U1, I5) + U1's remaining 4
+
+
+def test_result_is_a_fixed_point(tmp_path):
+    state = pp.preprocess(config(cascade_domain(tmp_path)))
+    assert pp.filter_users(state, 5) == 0
+    assert pp.filter_items(state, 1) == 0
+    assert pp.remove_isolated_items(state) == 0
+
+
+def test_item_only_as_tail_is_not_isolated(tmp_path):
+    state = merged(tmp_path, items__csv=VALID["items.csv"] + "I4,Book Four\n",
+                   kg__csv=VALID["kg.csv"] + "item,I3,sequel,item,I4\n")
+    assert pp.remove_isolated_items(state) == 0
+    assert "I4" in state.items
+
+
 # ---------------------------------------------------------------- real data
 
 def domain_or_skip(name):
@@ -184,3 +225,5 @@ def test_noisy_book_cleans_to_book():
     for name, b, n in zip(("pairs", "items", "auxs", "relations", "kg"), structure(book), structure(noisy)):
         assert b == n, name
     assert noisy.stats["users_removed"] == 400 and noisy.stats["items_removed"] == 271
+    assert book.stats["filter_rounds"] == noisy.stats["filter_rounds"] == 1
+    assert "isolated_items_removed" not in noisy.stats

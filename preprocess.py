@@ -8,7 +8,8 @@ Flow (design chapter 3):
     [2] merge duplicates  one entry per (user, item); KG exact duplicates collapse
     [3] user filter       drop users with < user_min distinct items
     [4] item filter       drop items with < item_min users, then clean the KG (4 steps)
-    [5] isolated items, repeat [3]-[5]   (not yet)
+    [5] isolated items    drop items that appear in no KG triple (head or tail)
+        repeat [3]-[5] until a round removes no interaction in [4] or [5]
     [6] split, [7] IDs, [8] write   (not yet)
 
 Standard library only (Python 3.10+).
@@ -134,7 +135,7 @@ def filter_users(state: State, user_min: int) -> int:
     return len(removed)
 
 
-def remove_items(state: State, removed: set):
+def remove_items(state: State, removed: set, stat: str = "items_removed"):
     """Remove items (and their pairs), then clean the KG (design 5.4):
     1. triples that contain a removed item
     2. aux no longer linked to a remaining item (tail of item -> aux)
@@ -162,7 +163,7 @@ def remove_items(state: State, removed: set):
     for r in dead_rel:
         del state.relations[r]
 
-    add_stat(state, "items_removed", len(removed))
+    add_stat(state, stat, len(removed))
     add_stat(state, "pairs_removed", before_pairs - len(state.pairs))
     add_stat(state, "aux_removed", len(dead_aux))
     add_stat(state, "kg_triples_removed", before_kg - len(state.kg))
@@ -179,17 +180,42 @@ def filter_items(state: State, item_min: int) -> int:
     return len(removed)
 
 
+def remove_isolated_items(state: State) -> int:
+    """Design 5.5: drop items that appear in no triple. Being only the tail of item -> item is
+    enough to stay (the training code adds reverse triples)."""
+    in_kg = {t[1] for t in state.kg if t[0] == "item"} | {t[4] for t in state.kg if t[3] == "item"}
+    removed = set(state.items) - in_kg
+    remove_items(state, removed, stat="isolated_items_removed")
+    return len(removed)
+
+
+def run_filters(state: State, user_min: int, item_min: int) -> int:
+    """Design 5.6: repeat [3] -> [4] -> [5]. Only an interaction removed in [4] or [5] can give the
+    user filter new work, so stop after a round in which [4] and [5] removed none.
+    Returns the number of rounds."""
+    rounds = 0
+    while True:
+        rounds += 1
+        users = filter_users(state, user_min)
+        pairs_before = len(state.pairs)
+        items = filter_items(state, item_min)
+        isolated = remove_isolated_items(state)
+        print(f"[3-5] 회차 {rounds}: 사용자 {users:,}명, 아이템 {items:,}개, 고립 아이템 {isolated:,}개 제거 "
+              f"→ 사용자 {len({u for u, _ in state.pairs}):,}명, 아이템 {len(state.items):,}, "
+              f"aux {len(state.auxs):,}, 관계 {len(state.relations):,}, KG {len(state.kg):,}, 쌍 {len(state.pairs):,}")
+        if len(state.pairs) == pairs_before:
+            break
+    state.stats["filter_rounds"] = rounds
+    return rounds
+
+
 # ---------------------------------------------------------------- driver
 
 def preprocess(config: Config) -> State:
     config.check()
     data = run_validation(config.raw_dir)
     state = merge_duplicates(data)
-    users = filter_users(state, config.user_min_interactions)
-    print(f"[3] 사용자 필터: {users:,}명 제거 → 사용자 {len({u for u, _ in state.pairs}):,}명, {len(state.pairs):,}쌍")
-    items = filter_items(state, config.item_min_interactions)
-    print(f"[4] 아이템 필터: {items:,}개 제거 → 아이템 {len(state.items):,}, aux {len(state.auxs):,}, "
-          f"관계 {len(state.relations):,}, KG {len(state.kg):,}")
+    run_filters(state, config.user_min_interactions, config.item_min_interactions)
     return state
 
 
