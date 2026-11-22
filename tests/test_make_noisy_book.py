@@ -1,4 +1,5 @@
 import collections
+import csv
 import json
 import sys
 from pathlib import Path
@@ -20,9 +21,15 @@ def pairs_of(path):
 
 
 @pytest.fixture(scope="module")
-def noisy(tmp_path_factory):
+def noisy_all(tmp_path_factory):
     out = tmp_path_factory.mktemp("book_noisy")
     summary = mn.make_noisy(CLEAN_RAW, out, seed=2020)
+    return out, summary
+
+
+@pytest.fixture(scope="module")
+def noisy(noisy_all):
+    out, summary = noisy_all
     return out, summary["interactions.jsonl"]
 
 
@@ -58,6 +65,26 @@ def test_cleaning_recovers_clean_pairs(noisy):
     per_user = collections.Counter(u for u, _ in merged)
     kept = {(u, i) for u, i in merged if per_user[u] >= 5}
     assert kept == clean
+
+
+def test_relations_phantom_appended(noisy_all):
+    out, summary = noisy_all
+    clean = (CLEAN_RAW / "relations.csv").read_bytes()
+    noisy = (out / "raw/relations.csv").read_bytes()
+    assert noisy.startswith(clean)                         # original rows byte-identical
+
+    with open(out / "raw/relations.csv", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    new = rows[20:]
+    assert summary["relations.csv"] == {"clean_rows": 20, "noisy_rows": 21, "phantom_relations": 1}
+    assert [r["relation"] for r in new] == ["noisy:phantomLink"]
+    assert len({r["relation"] for r in rows}) == len(rows)  # spec: no duplicate relation
+    for r in new:                                          # spec 6.5 rules still hold
+        assert (r["head_type"], r["tail_type"]) == ("item", "aux")
+        assert "{head}" in r["sentence"] and "{tails}" in r["sentence"]
+        assert "{tail}" in r["reverse_sentence"] and "{head}" in r["reverse_sentence"]
+        for t in (r["sentence"], r["reverse_sentence"]):
+            assert "'" not in t and '"' not in t and not t.endswith(".")
 
 
 def test_untouched_files_copied_unchanged(noisy):

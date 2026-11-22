@@ -30,7 +30,16 @@ interactions.jsonl (appended after the original rows):
   those of the clean data; only count/reviews of the duplicated pairs differ.
   Reviews are never empty: the spec requires a non-empty review (validation would stop).
 
-items.csv, auxs.csv, kg.csv, relations.csv: not yet (copied unchanged).
+relations.csv (appended):
+  A new relation used only by the phantom items (see items.csv / kg.csv).
+  Once those items are removed it has no triples left -> removed (KG cleanup step 4).
+  Until the kg.csv injector exists it is simply an unused relation (a warning).
+
+items.csv, auxs.csv, kg.csv: not yet (copied unchanged).
+
+Phantom items (planned across relations -> items -> auxs -> kg): items with no
+interactions, plus aux / relations / triples that only they use, so that removing them
+runs every KG cleanup step. Injectors share their names through data["phantom"].
 
 Standard library only. Deterministic for a given seed.
 """
@@ -51,6 +60,12 @@ N_TRIPLE_PAIRS = 50        # ... of which appear three times in total
 N_SMALL_USERS = 300        # 1-4 distinct items
 N_TRAP_USERS = 100         # 4 distinct items + 1 duplicate row
 NEW_USER_PREFIX = "NOISY_U"
+
+# relations.csv
+PHANTOM_RELATIONS = [
+    {"relation": "noisy:phantomLink", "head_type": "item", "tail_type": "aux",
+     "sentence": "{head} is linked to {tails}", "reverse_sentence": "{tail} is linked to {head}"},
+]
 
 
 # ---------------------------------------------------------------- load / write
@@ -79,6 +94,9 @@ def check_book_assumptions(data: dict):
         sys.exit("no item without interactions; book has 221. Is this the book data?")
     if any(r["user_id"].startswith(NEW_USER_PREFIX) for r in rows):
         sys.exit(f"user IDs already use the prefix {NEW_USER_PREFIX!r}")
+    existing_relations = {r["relation"] for r in data["relations"]}
+    if any(r["relation"] in existing_relations for r in PHANTOM_RELATIONS):
+        sys.exit("phantom relation name already exists in relations.csv")
 
 
 def load_raw(raw: Path) -> dict:
@@ -86,7 +104,17 @@ def load_raw(raw: Path) -> dict:
     return {
         "interactions": read_jsonl(raw / "interactions.jsonl"),
         "items": read_csv(raw / "items.csv"),
+        "relations": read_csv(raw / "relations.csv"),
+        "phantom": {},
     }
+
+
+def write_csv(path: Path, rows):
+    """Same CSV dialect as tools/convert_book.py, so unchanged rows stay byte-identical."""
+    with open(path, encoding="utf-8", newline="", mode="w") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]), lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
 
 
 def write_jsonl(path: Path, rows):
@@ -174,10 +202,24 @@ def inject_interactions(data: dict, rng: random.Random) -> dict:
     }
 
 
+def inject_relations(data: dict, rng: random.Random) -> dict:
+    """Relation(s) used only by phantom items. Returns manifest part."""
+    clean = len(data["relations"])
+    new = [dict(r) for r in PHANTOM_RELATIONS]
+    data["relations"] = data["relations"] + new
+    data["phantom"]["relations"] = [r["relation"] for r in new]
+    return {
+        "summary": {"clean_rows": clean, "noisy_rows": clean + len(new), "phantom_relations": len(new)},
+        "phantom_relations": new,
+    }
+
+
 # (file name, injector, writer). Order matters: later injectors see earlier changes.
 INJECTORS = (
     ("interactions.jsonl", inject_interactions,
      lambda data, path: write_jsonl(path, data["interactions"])),
+    ("relations.csv", inject_relations,
+     lambda data, path: write_csv(path, data["relations"])),
 )
 
 
