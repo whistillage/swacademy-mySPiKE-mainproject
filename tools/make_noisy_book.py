@@ -31,25 +31,34 @@ interactions.jsonl (appended after the original rows):
   Reviews are never empty: the spec requires a non-empty review (validation would stop).
 
 relations.csv (appended):
-  A new relation used only by the phantom items (see items.csv / kg.csv).
-  Once those items are removed it has no triples left -> removed (KG cleanup step 4).
-  Until the kg.csv injector exists it is simply an unused relation (a warning).
+  Two relations used only by phantom triples: noisy:phantomLink (item -> aux) and
+  noisy:phantomAuxLink (aux -> aux). Once the phantom items / aux are removed they have
+  no triples left -> removed (KG cleanup step 4).
 
 items.csv (appended):
   Phantom items with no interactions -> removed by the item filter. They are added after
   the interactions injector ran, so no fake user touches them.
-  Intermediate state: they get their triples only from the kg.csv injector; until then
-  they violate required condition 1 (every item has a 1-hop neighbour) -> validation error.
+  Their triples come from the kg.csv injector.
 
 auxs.csv (appended):
   Phantom aux linked only to phantom items -> removed once nothing links them to a
   remaining item (KG cleanup step 2). IDs follow the book convention (res:..., resource).
-  Intermediate state: until the kg.csv injector links them they violate required
-  condition 2 (every aux is directly linked to an item) -> validation error.
+  They are linked by the kg.csv injector.
 
-kg.csv: not yet (copied unchanged).
+kg.csv (appended):
+  1. phantom item -> phantom aux     noisy:phantomLink; every phantom aux gets >= 1 item
+                                      (cleanup step 1 removes them, step 2 the aux)
+  2. phantom item -> existing aux    a book relation + an aux that a clean item with
+                                      interactions also uses (step 1 removes the triple,
+                                      the aux must survive)
+  3. same (head, tail), 2 relations  phantom item -> phantom aux also via dct:subject
+                                      (spec 5.7: allowed)
+  4. phantom aux -> phantom aux      noisy:phantomAuxLink chain, no reverse pairs
+                                      (cleanup step 3)
+  5. exact duplicate rows            copies of clean rows and of phantom rows (spec 5.7)
+  All required conditions of the spec hold again after this injector (no validation error).
 
-Phantom items (planned across relations -> items -> auxs -> kg): items with no
+Phantom items (built across relations -> items -> auxs -> kg): items with no
 interactions, plus aux / relations / triples that only they use, so that removing them
 runs every KG cleanup step. Injectors share their names through data["phantom"].
 
@@ -85,7 +94,18 @@ PHANTOM_AUX_PREFIX = "res:Noisy_Phantom_Aux_"
 PHANTOM_RELATIONS = [
     {"relation": "noisy:phantomLink", "head_type": "item", "tail_type": "aux",
      "sentence": "{head} is linked to {tails}", "reverse_sentence": "{tail} is linked to {head}"},
+    {"relation": "noisy:phantomAuxLink", "head_type": "aux", "tail_type": "aux",
+     "sentence": "{head} is related to {tails}", "reverse_sentence": "{tail} is related to {head}"},
 ]
+PHANTOM_ITEM_AUX_RELATION = "noisy:phantomLink"
+PHANTOM_AUX_AUX_RELATION = "noisy:phantomAuxLink"
+
+# kg.csv
+N_PHANTOM_EXISTING_AUX = 2      # existing-aux triples per phantom item
+N_PHANTOM_MULTI_RELATION = 10   # phantom items that also link their phantom aux via dct:subject
+MULTI_RELATION = "dct:subject"
+N_KG_DUP_CLEAN = 300            # extra copies of clean rows
+N_KG_DUP_PHANTOM = 20           # extra copies of phantom rows
 
 
 # ---------------------------------------------------------------- load / write
@@ -130,6 +150,7 @@ def load_raw(raw: Path) -> dict:
         "items": read_csv(raw / "items.csv"),
         "auxs": read_csv(raw / "auxs.csv"),
         "relations": read_csv(raw / "relations.csv"),
+        "kg": read_csv(raw / "kg.csv"),
         "phantom": {},
     }
 
@@ -265,6 +286,53 @@ def inject_auxs(data: dict, rng: random.Random) -> dict:
     }
 
 
+def inject_kg(data: dict, rng: random.Random) -> dict:
+    """Triples for the phantom items/aux, aux -> aux chain, exact duplicate rows."""
+    kg = data["kg"]
+    ph_items, ph_aux = data["phantom"]["items"], data["phantom"]["auxs"]
+    active = {r["item_id"] for r in data["interactions"]
+              if not r["user_id"].startswith(NEW_USER_PREFIX)}
+    # clean item -> aux rows whose item has interactions: their aux survive preprocessing
+    donor_rows = [r for r in kg if r["head_type"] == "item" and r["head"] in active
+                  and r["tail_type"] == "aux"]
+
+    def triple(head_type, head, relation, tail_type, tail):
+        return {"head_type": head_type, "head": head, "relation": relation,
+                "tail_type": tail_type, "tail": tail}
+
+    to_phantom, to_existing, multi, aux_aux = [], [], [], []
+    for k, item in enumerate(ph_items):
+        aux = ph_aux[k % len(ph_aux)]
+        to_phantom.append(triple("item", item, PHANTOM_ITEM_AUX_RELATION, "aux", aux))
+        for donor in rng.sample(donor_rows, N_PHANTOM_EXISTING_AUX):
+            to_existing.append(triple("item", item, donor["relation"], "aux", donor["tail"]))
+        if k < N_PHANTOM_MULTI_RELATION:
+            multi.append(triple("item", item, MULTI_RELATION, "aux", aux))
+    for a, b in zip(ph_aux, ph_aux[1:]):
+        aux_aux.append(triple("aux", a, PHANTOM_AUX_AUX_RELATION, "aux", b))
+
+    phantom_rows = to_phantom + to_existing + multi + aux_aux
+    dup_clean = [dict(kg[i]) for i in rng.sample(range(len(kg)), N_KG_DUP_CLEAN)]
+    dup_phantom = [dict(r) for r in rng.sample(phantom_rows, N_KG_DUP_PHANTOM)]
+    extra = phantom_rows + dup_clean + dup_phantom
+    data["kg"] = kg + extra
+
+    return {
+        "summary": {
+            "clean_rows": len(kg),
+            "noisy_rows": len(kg) + len(extra),
+            "phantom_item_to_phantom_aux": len(to_phantom),
+            "phantom_item_to_existing_aux": len(to_existing),
+            "phantom_multi_relation": len(multi),
+            "phantom_aux_to_aux": len(aux_aux),
+            "duplicate_rows_clean": len(dup_clean),
+            "duplicate_rows_phantom": len(dup_phantom),
+        },
+        "phantom_rows": phantom_rows,
+        "duplicate_rows": dup_clean + dup_phantom,
+    }
+
+
 # (file name, injector, writer). Order matters: later injectors see earlier changes.
 # interactions first: its fake users pick from the clean items only, never phantom items.
 INJECTORS = (
@@ -276,6 +344,8 @@ INJECTORS = (
      lambda data, path: write_csv(path, data["items"])),
     ("auxs.csv", inject_auxs,
      lambda data, path: write_csv(path, data["auxs"])),
+    ("kg.csv", inject_kg,
+     lambda data, path: write_csv(path, data["kg"])),
 )
 
 
