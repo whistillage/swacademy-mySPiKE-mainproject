@@ -13,7 +13,9 @@ import csv
 import json
 import math
 import re
+import statistics
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +38,16 @@ NODE_TYPES = ("item", "aux")
 PLACEHOLDERS = ("head", "tail", "tails")
 REQUIRED_PLACEHOLDERS = {"sentence": ("head", "tails"), "reverse_sentence": ("tail", "head")}
 TIMESTAMP_LIMIT = 10 ** 11          # seconds; 13-digit millisecond values are >= 10**12
+
+# filters (preprocessing design 5.3) and spec 5.6 recommended conditions
+USER_MIN_INTERACTIONS = 5
+REC_RELATIONS = (3, 30)             # (2) number of used relations
+REC_RELATION_MIN_USES = 10          # (3)
+REC_MEDIAN_TRIPLES = 5              # (4) median triples per item (as head)
+REC_MAX_TRIPLES = 100               # (4) per item
+REC_SINGLE_ITEM_AUX = 0.70          # (5) share of aux linked to exactly one item
+REC_TOP_RELATION = 0.80             # (6) share of the most used relation
+REC_GIANT_AUX = 0.30                # (7) aux linked to this share of all items
 
 ERROR, WARNING, INFO = "ERROR", "WARNING", "INFO"
 
@@ -71,6 +83,23 @@ MESSAGES = {
     "E_AUX_NOT_LINKED": (ERROR, "아이템과 직접 연결되지 않은 aux입니다 (item → aux 트리플의 tail로 나와야 함)"),
     "W_ID_WHITESPACE": (WARNING, "앞뒤에 공백이 있는 ID가 있습니다 (지운 뒤 처리됩니다)"),
     "W_BLANK_LINE": (WARNING, "빈 줄이 있습니다 (건너뜁니다)"),
+    "W_DUP_PAIR": (WARNING, "같은 (user_id, item_id)가 여러 번 있습니다 (전처리에서 하나로 합쳐집니다)"),
+    "W_FEW_INTERACTIONS": (WARNING, f"상호작용이 {USER_MIN_INTERACTIONS}건 미만인 사용자입니다 (중복을 합친 뒤 기준, 전처리에서 제외됩니다)"),
+    "W_OPTIONAL_ALL_NULL": (WARNING, "권장 컬럼이 있지만 값이 모두 null입니다"),
+    "W_ITEM_NO_INTERACTION": (WARNING, "상호작용이 없는 아이템입니다 (전처리에서 제외됩니다)"),
+    "W_AUX_TYPE_CASE": (WARNING, "aux_type은 영어 소문자로 통일합니다"),
+    "W_AUX_SAME_NAME": (WARNING, "이름과 aux_type이 모두 같은 aux가 여럿입니다 (같은 대상이면 aux_id를 하나로)"),
+    "W_TEMPLATE_STYLE": (WARNING, "템플릿에 따옴표나 끝 마침표가 있습니다 (자동으로 붙습니다)"),
+    "W_UNUSED_RELATION": (WARNING, "kg.csv에서 쓰이지 않는 관계입니다"),
+    "W_KG_DUP_ROW": (WARNING, "완전히 같은 트리플 행이 있습니다 (전처리에서 하나만 남깁니다)"),
+    "W_NO_SHARED_AUX": (WARNING, "다른 아이템과 공유하는 aux가 없는 아이템입니다 (권장 5.6-1)"),
+    "W_RELATION_COUNT": (WARNING, f"쓰인 관계 수가 권장 범위 {REC_RELATIONS[0]}~{REC_RELATIONS[1]}개 밖입니다 (권장 5.6-2)"),
+    "W_RARE_RELATION": (WARNING, f"{REC_RELATION_MIN_USES}회 미만으로 쓰인 관계입니다 (권장 5.6-3)"),
+    "W_FEW_TRIPLES": (WARNING, f"아이템당 트리플 수 중앙값이 {REC_MEDIAN_TRIPLES} 미만입니다 (권장 5.6-4)"),
+    "W_MANY_TRIPLES": (WARNING, f"트리플이 {REC_MAX_TRIPLES}개를 넘는 아이템입니다 (권장 5.6-4)"),
+    "W_SINGLE_ITEM_AUX": (WARNING, f"아이템 하나에만 연결된 aux가 {REC_SINGLE_ITEM_AUX:.0%}를 넘습니다 (권장 5.6-5)"),
+    "W_TOP_RELATION": (WARNING, f"한 관계가 전체 트리플의 {REC_TOP_RELATION:.0%}를 넘습니다 (권장 5.6-6)"),
+    "W_GIANT_AUX": (WARNING, f"전체 아이템의 {REC_GIANT_AUX:.0%} 이상과 연결된 aux입니다. 유지할지 검토하세요 (권장 5.6-7)"),
     "I_SKIPPED": (INFO, "앞의 에러 때문에 검사를 건너뛰었습니다"),
 }
 
@@ -97,12 +126,16 @@ class Report:
     def __init__(self, max_examples: int = 5):
         self.max_examples = max_examples
         self.issues = {}   # (code, file) -> Issue, in insertion order
+        self.stats = {}    # file -> {label: value}, statistics for the INFO section
 
     def add(self, code: str, file: str, example=None, count: int = 1):
         issue = self.issues.setdefault((code, file), Issue(code, file))
         issue.count += count
         if example is not None and len(issue.examples) < self.max_examples:
             issue.examples.append(example)
+
+    def stat(self, file: str, label: str, value):
+        self.stats.setdefault(file, {})[label] = value
 
     def by_level(self, level):
         return [i for i in self.issues.values() if i.level == level]
@@ -119,20 +152,49 @@ class Report:
             "ok": not self.has_errors,
             "issues": [{"level": i.level, "code": i.code, "file": i.file, "message": i.message,
                         "count": i.count, "examples": i.examples} for i in self.issues.values()],
+            "stats": self.stats,
         }
 
     def render(self) -> str:
         lines = []
         for level in (ERROR, WARNING, INFO):
             issues = self.by_level(level)
-            lines.append(f"== {level} ({len(issues)})")
+            lines.append(f"== {level}" if level == INFO else f"== {level} ({len(issues)})")
             for i in issues:
                 lines.append(f"[{i.code}] {i.file}: {i.message} ({i.count:,}건)")
                 for ex in i.examples:
                     lines.append(f"    - {ex}")
+            if level == INFO:
+                for file, stats in self.stats.items():
+                    lines.append(f"[{file}]")
+                    for label, value in stats.items():
+                        lines.append(f"    {label}: {format_value(value)}")
             lines.append("")
         lines.append("결과: " + ("에러 없음" if not self.has_errors else "에러 있음 (제출 불가)"))
         return "\n".join(lines)
+
+
+def format_value(v) -> str:
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, int):
+        return f"{v:,}"
+    if isinstance(v, float):
+        return f"{v:,.3f}".rstrip("0").rstrip(".")
+    if isinstance(v, dict):
+        return ", ".join(f"{k} {format_value(x)}" for k, x in v.items())
+    return str(v)
+
+
+def distribution(values) -> dict:
+    values = list(values)
+    if not values:
+        return {"최소": 0, "중앙값": 0, "최대": 0}
+    return {"최소": min(values), "중앙값": statistics.median(values), "최대": max(values)}
+
+
+def share(part: int, whole: int) -> str:
+    return f"{part:,} ({part / whole:.1%})" if whole else f"{part:,}"
 
 
 # ---------------------------------------------------------------- loading
@@ -435,6 +497,169 @@ def check_links(data: Dataset, report: Report):
             report.add("E_AUX_NOT_LINKED", "auxs.csv", f"auxs.csv:{r['_line']} aux_id={r['aux_id']!r}")
 
 
+# ---------------------------------------------------------------- warnings and statistics
+
+def warn_interactions(data: Dataset, report: Report):
+    name = "interactions.jsonl"
+    rows = data.interactions
+    if rows is None:
+        return
+    lines = defaultdict(list)
+    for r in rows:
+        lines[(r["user_id"], r["item_id"])].append(r["_line"])
+    for (u, i), ls in lines.items():
+        if len(ls) > 1:
+            report.add("W_DUP_PAIR", name, f"user_id={u!r} item_id={i!r}: {len(ls)}행 (줄 {', '.join(map(str, ls[:5]))})")
+
+    per_user = Counter(u for u, _ in lines)
+    few = {u: n for u, n in per_user.items() if n < USER_MIN_INTERACTIONS}
+    for u, n in few.items():
+        report.add("W_FEW_INTERACTIONS", name, f"user_id={u!r}: {n}건")
+
+    for key in data.optional_keys:
+        if all(r.get(key) is None for r in rows):
+            report.add("W_OPTIONAL_ALL_NULL", name, key)
+
+    report.stat(name, "행", len(rows))
+    report.stat(name, "서로 다른 (user, item) 쌍", len(lines))
+    report.stat(name, "중복으로 합쳐질 행", len(rows) - len(lines))
+    report.stat(name, "사용자", len(per_user))
+    report.stat(name, "사용자당 상호작용", distribution(per_user.values()))
+    report.stat(name, f"정확히 {USER_MIN_INTERACTIONS}건인 사용자",
+                share(sum(n == USER_MIN_INTERACTIONS for n in per_user.values()), len(per_user)))
+    report.stat(name, "필터 예상: 제외될 사용자", share(len(few), len(per_user)))
+    report.stat(name, "필터 예상: 제외될 쌍", share(sum(few.values()), len(lines)))
+    for key in data.optional_keys:
+        values = [r[key] for r in rows if r.get(key) is not None]
+        report.stat(name, f"{key} null 비율", share(len(rows) - len(values), len(rows)))
+        valid = [v for v in values if (valid_timestamp if key == "timestamp" else valid_rating)(v)]
+        if not valid:
+            continue
+        if key == "timestamp":
+            from datetime import datetime, timezone
+            day = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d")
+            report.stat(name, "timestamp 기간 (UTC)", f"{day(min(valid))} ~ {day(max(valid))}")
+        else:
+            report.stat(name, "rating 분포", dict(sorted(Counter(round(v) for v in valid).items())))
+            report.stat(name, "rating 평균", statistics.mean(valid))
+
+
+def warn_items_auxs(data: Dataset, report: Report):
+    if data.items is not None:
+        report.stat("items.csv", "아이템", len(data.items))
+        if data.interactions is None:
+            skipped(report, "items.csv", "상호작용 없는 아이템", "interactions.jsonl")
+        else:
+            used = {r["item_id"] for r in data.interactions}
+            for r in data.items:
+                if r["item_id"] not in used:
+                    report.add("W_ITEM_NO_INTERACTION", "items.csv", f"items.csv:{r['_line']} item_id={r['item_id']!r}")
+            report.stat("items.csv", "상호작용 없는 아이템",
+                        share(sum(r["item_id"] not in used for r in data.items), len(data.items)))
+
+    if data.auxs is not None:
+        name = "auxs.csv"
+        groups = defaultdict(list)
+        for r in data.auxs:
+            t = r["aux_type"].strip()
+            if not (t.isascii() and t == t.lower()):
+                report.add("W_AUX_TYPE_CASE", name, f"{name}:{r['_line']} aux_type={r['aux_type']!r}")
+            groups[(r["name"].strip(), t)].append(r["aux_id"])
+        for (n, t), ids in groups.items():
+            if len(set(ids)) > 1:
+                report.add("W_AUX_SAME_NAME", name, f"{n!r} ({t}): " + ", ".join(ids[:5]))
+        report.stat(name, "aux", len(data.auxs))
+        report.stat(name, "aux_type별", dict(Counter(r["aux_type"].strip() for r in data.auxs).most_common(10)))
+
+
+def warn_relations(data: Dataset, report: Report):
+    name = "relations.csv"
+    if data.relations is None:
+        return
+    for r in data.relations:
+        for col in ("sentence", "reverse_sentence"):
+            t = r[col].strip()
+            if "'" in t or '"' in t or t.endswith("."):
+                report.add("W_TEMPLATE_STYLE", name, f"{name}:{r['_line']} {r['relation']} {col}: {r[col]!r}")
+    if data.kg_triples is not None:
+        used = {rel for _, _, rel, _, _ in data.kg_triples}
+        for r in data.relations:
+            if r["relation"] in data.relation_types and r["relation"] not in used:
+                report.add("W_UNUSED_RELATION", name, f"{name}:{r['_line']} {r['relation']}")
+    report.stat(name, "관계", len(data.relations))
+    if data.relation_types:
+        report.stat(name, "타입 조합별",
+                    dict(Counter(f"{h} → {t}" for h, t in data.relation_types.values()).most_common()))
+
+
+def warn_kg(data: Dataset, report: Report):
+    """Duplicate rows (format-valid rows) and spec 5.6 recommended conditions (structurally valid triples)."""
+    name = "kg.csv"
+    if data.kg_rows is None:
+        return
+    first = {}
+    for triple, line in data.kg_rows:
+        if triple in first:
+            report.add("W_KG_DUP_ROW", name, f"{name}:{line} (처음: {first[triple]}행) {triple[1]} --{triple[2]}--> {triple[4]}")
+        else:
+            first[triple] = line
+
+    triples = data.kg_triples
+    items = [r["item_id"] for r in data.items]
+    heads = Counter(h for ht, h, _, _, _ in triples if ht == "item")
+    aux_items = defaultdict(set)                      # aux -> items linking it (item -> aux)
+    item_auxs = defaultdict(set)
+    for ht, h, _, tt, t in triples:
+        if ht == "item" and tt == "aux":
+            aux_items[t].add(h)
+            item_auxs[h].add(t)
+    rel_uses = Counter(rel for _, _, rel, _, _ in triples)
+
+    # (1) no shared aux
+    for item in items:
+        if not any(len(aux_items[a]) > 1 for a in item_auxs.get(item, ())):
+            report.add("W_NO_SHARED_AUX", name, f"item_id={item!r}")
+    # (2) number of used relations
+    if not REC_RELATIONS[0] <= len(rel_uses) <= REC_RELATIONS[1]:
+        report.add("W_RELATION_COUNT", name, f"{len(rel_uses)}개")
+    # (3) rarely used relations
+    for rel, n in sorted(rel_uses.items(), key=lambda x: (x[1], x[0])):
+        if n < REC_RELATION_MIN_USES:
+            report.add("W_RARE_RELATION", name, f"{rel}: {n}회")
+    # (4) triples per item (as head; items without outgoing triples count as 0)
+    per_item = [heads.get(i, 0) for i in items]
+    if per_item and statistics.median(per_item) < REC_MEDIAN_TRIPLES:
+        report.add("W_FEW_TRIPLES", name, f"중앙값 {format_value(statistics.median(per_item))}")
+    for i in items:
+        if heads.get(i, 0) > REC_MAX_TRIPLES:
+            report.add("W_MANY_TRIPLES", name, f"item_id={i!r}: {heads[i]}개")
+    # (5) aux linked to a single item
+    degrees = [len(v) for v in aux_items.values()]
+    single = sum(d == 1 for d in degrees)
+    if degrees and single / len(degrees) > REC_SINGLE_ITEM_AUX:
+        report.add("W_SINGLE_ITEM_AUX", name, share(single, len(degrees)))
+    # (6) dominant relation
+    if rel_uses:
+        rel, n = rel_uses.most_common(1)[0]
+        if n / len(triples) > REC_TOP_RELATION:
+            report.add("W_TOP_RELATION", name, f"{rel}: {share(n, len(triples))}")
+    # (7) giant aux
+    for aux, linked in sorted(aux_items.items(), key=lambda x: -len(x[1])):
+        if items and len(linked) >= REC_GIANT_AUX * len(items):
+            report.add("W_GIANT_AUX", name, f"aux_id={aux!r}: 아이템 {share(len(linked), len(items))}")
+
+    pairs = Counter((ht, h, tt, t) for ht, h, _, tt, t in triples)
+    report.stat(name, "행 (형식이 맞는 행)", len(data.kg_rows))
+    report.stat(name, "트리플 (중복 제거, 구조 검사 통과)", len(triples))
+    report.stat(name, "유형별", dict(Counter(f"{ht} → {tt}" for ht, _, _, tt, _ in triples).most_common()))
+    report.stat(name, "쓰인 관계", len(rel_uses))
+    report.stat(name, "관계별 사용", dict(rel_uses.most_common()))
+    report.stat(name, "아이템당 트리플 (head 기준)", distribution(per_item))
+    report.stat(name, "aux당 연결 아이템", distribution(degrees))
+    report.stat(name, "아이템 하나에만 연결된 aux", share(single, len(degrees)))
+    report.stat(name, "관계가 여러 개인 (head, tail) 쌍", sum(n > 1 for n in pairs.values()))
+
+
 def validate(raw_dir, max_examples: int = 5):
     """Run all checks. Returns (Report, Dataset)."""
     raw = Path(raw_dir)
@@ -446,6 +671,10 @@ def validate(raw_dir, max_examples: int = 5):
     check_relations(data, report)
     check_kg(data, report)
     check_links(data, report)
+    warn_interactions(data, report)
+    warn_items_auxs(data, report)
+    warn_relations(data, report)
+    warn_kg(data, report)
     return report, data
 
 

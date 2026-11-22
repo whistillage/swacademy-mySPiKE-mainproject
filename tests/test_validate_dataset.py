@@ -52,15 +52,25 @@ def run(tmp_path, **changes):
     return report, data
 
 
+# Warnings the tiny VALID dataset always raises (too small for the spec 5.6 recommendations).
+BASELINE = {"W_FEW_INTERACTIONS", "W_NO_SHARED_AUX", "W_RELATION_COUNT", "W_RARE_RELATION",
+            "W_FEW_TRIPLES", "W_GIANT_AUX"}
+
+
+def new_codes(report):
+    """Codes beyond the baseline warnings of VALID."""
+    return report.codes() - BASELINE
+
+
 def inter(*rows):
     return list(VALID["interactions.jsonl"]) + list(rows)
 
 
 # ---------------------------------------------------------------- valid input
 
-def test_valid_dataset_has_no_issues(tmp_path):
+def test_valid_dataset_has_only_baseline_warnings(tmp_path):
     report, data = run(tmp_path)
-    assert report.issues == {}
+    assert report.codes() == BASELINE
     assert len(data.interactions) == 3 and len(data.items) == 3 and data.optional_keys == ()
 
 
@@ -89,7 +99,7 @@ def test_not_utf8(tmp_path):
 
 def test_bom_is_accepted(tmp_path):
     report, _ = run(tmp_path, items__csv="﻿" + VALID["items.csv"])
-    assert report.issues == {}
+    assert new_codes(report) == set()
 
 
 def test_missing_column(tmp_path):
@@ -110,7 +120,7 @@ def test_empty_csv_value(tmp_path, value):
 
 def test_id_whitespace_is_stripped_and_warned(tmp_path):
     report, data = run(tmp_path, items__csv="item_id,name\n I1 ,Book One\nI2,Book Two\nI3,Book Three\n")
-    assert report.codes() == {"W_ID_WHITESPACE"}
+    assert new_codes(report) == {"W_ID_WHITESPACE"}
     assert data.items[0]["item_id"] == "I1"
 
 
@@ -131,13 +141,13 @@ def test_interaction_errors(tmp_path, line, code):
 
 def test_blank_line_is_warned(tmp_path):
     report, data = run(tmp_path, interactions__jsonl=inter("", VALID["interactions.jsonl"][0]))
-    assert report.codes() == {"W_BLANK_LINE"}
+    assert new_codes(report) == {"W_BLANK_LINE", "W_DUP_PAIR"}
     assert len(data.interactions) == 4
 
 
 def test_interaction_id_whitespace(tmp_path):
     report, data = run(tmp_path, interactions__jsonl=inter({"user_id": "U9", "item_id": " I1", "review": "x"}))
-    assert report.codes() == {"W_ID_WHITESPACE"}           # stripped, so the item reference is fine
+    assert new_codes(report) == {"W_ID_WHITESPACE"}           # stripped, so the item reference is fine
     assert data.interactions[-1]["item_id"] == "I1"
 
 
@@ -152,7 +162,7 @@ def with_optional(**values):
 def test_optional_columns_valid(tmp_path):
     report, data = run(tmp_path, interactions__jsonl=with_optional(
         timestamp=[1167609600, None, 0], rating=[4, 4.111, None]))
-    assert report.issues == {}
+    assert new_codes(report) == set()
     assert data.optional_keys == ("timestamp", "rating")
 
 
@@ -262,7 +272,7 @@ def test_item_only_as_tail_is_fine(tmp_path):
     """I4 has no outgoing triple but is the tail of item -> item: allowed."""
     report, _ = run(tmp_path, items__csv=VALID["items.csv"] + "I4,Book Four\n",
                     kg__csv=KG_OK + "item,I3,sequel,item,I4\n")
-    assert report.issues == {}
+    assert report.codes(vd.ERROR) == set()
 
 
 def test_aux_not_linked(tmp_path):
@@ -280,7 +290,7 @@ def test_aux_linked_only_via_aux_aux_is_error(tmp_path):
 def test_aux_aux_between_linked_aux_is_fine(tmp_path):
     rel = REL_OK + "related,aux,aux,{head} is related to {tails},{tail} is related to {head}\n"
     report, data = run(tmp_path, relations__csv=rel, kg__csv=KG_OK + "aux,A1,related,aux,A2\n")
-    assert report.issues == {}
+    assert report.codes(vd.ERROR) == set()
     assert ("aux", "A1", "related", "aux", "A2") in data.kg_triples
 
 
@@ -319,3 +329,98 @@ def test_kg_checks_skipped_without_items(tmp_path):
     skipped_files = {i.file for i in report.by_level(vd.INFO)}
     assert {"kg.csv", "auxs.csv"} <= skipped_files
     assert not report.codes(vd.ERROR) - {"E_FILE_MISSING"}
+
+
+# ---------------------------------------------------------------- warnings
+
+def examples(report, code, file):
+    return report.issues[(code, file)].examples
+
+
+def test_duplicate_pair_and_merge_before_user_count(tmp_path):
+    dup = {"user_id": "U2", "item_id": "I3", "review": "again"}
+    report, _ = run(tmp_path, interactions__jsonl=inter(dup, dup))
+    assert new_codes(report) == {"W_DUP_PAIR"}
+    assert report.issues[("W_DUP_PAIR", "interactions.jsonl")].count == 1
+    # U2 has 3 rows but one distinct item
+    assert "user_id='U2': 1건" in examples(report, "W_FEW_INTERACTIONS", "interactions.jsonl")
+
+
+def test_optional_all_null(tmp_path):
+    report, _ = run(tmp_path, interactions__jsonl=with_optional(rating=[None, None, None]))
+    assert new_codes(report) == {"W_OPTIONAL_ALL_NULL"}
+
+
+def test_item_without_interaction(tmp_path):
+    report, _ = run(tmp_path, items__csv=VALID["items.csv"] + "I4,Book Four\n",
+                    kg__csv=KG_OK + "item,I4,author,aux,A2\n")
+    assert new_codes(report) == {"W_ITEM_NO_INTERACTION"}
+
+
+def test_item_without_interaction_skipped_without_interactions(tmp_path):
+    report, _ = run(tmp_path, interactions__jsonl=None)
+    assert "W_ITEM_NO_INTERACTION" not in report.codes()
+    assert ("I_SKIPPED", "items.csv") in report.issues
+
+
+@pytest.mark.parametrize("aux_type", ["Person", "PERSON", "인물"])
+def test_aux_type_case(tmp_path, aux_type):
+    report, _ = run(tmp_path, auxs__csv=f"aux_id,name,aux_type\nA1,Author One,{aux_type}\nA2,Genre Two,genre\n")
+    assert new_codes(report) == {"W_AUX_TYPE_CASE"}
+
+
+@pytest.mark.parametrize("aux_type, warned", [("person", True), ("genre", False)])
+def test_aux_same_name(tmp_path, aux_type, warned):
+    report, _ = run(tmp_path, auxs__csv=VALID["auxs.csv"] + f"A3,Author One,{aux_type}\n",
+                    kg__csv=KG_OK + "item,I3,author,aux,A3\n")
+    assert ("W_AUX_SAME_NAME" in report.codes()) == warned
+
+
+@pytest.mark.parametrize("sentence", ["{head} lists '{tails}' as its author", "{head} lists {tails} as its author."])
+def test_template_style(tmp_path, sentence):
+    rel = REL_HEADER + f"author,item,aux,{sentence},{{tail}} wrote {{head}}\n" + REL_OK.split("\n", 2)[2]
+    report, _ = run(tmp_path, relations__csv=rel)
+    assert new_codes(report) == {"W_TEMPLATE_STYLE"}
+
+
+def test_unused_relation(tmp_path):
+    report, _ = run(tmp_path, relations__csv=REL_OK + "genre,item,aux,{head} is {tails},{tail} covers {head}\n")
+    assert new_codes(report) == {"W_UNUSED_RELATION"}
+
+
+def test_kg_duplicate_rows(tmp_path):
+    report, data = run(tmp_path, kg__csv=KG_OK + "item,I1,author,aux,A1\n" * 2)
+    assert new_codes(report) == {"W_KG_DUP_ROW"}
+    assert report.issues[("W_KG_DUP_ROW", "kg.csv")].count == 2
+
+
+def test_recommended_conditions_on_tiny_data(tmp_path):
+    """VALID: I3 is the only item of A2 (1), 2 relations (2), both rare (3), median 1 (4),
+    A1 in 2/3 and A2 in 1/3 of the items, both >= 30% (7)."""
+    report, _ = run(tmp_path)
+    assert examples(report, "W_NO_SHARED_AUX", "kg.csv") == ["item_id='I3'"]
+    assert examples(report, "W_RELATION_COUNT", "kg.csv") == ["2개"]
+    assert examples(report, "W_RARE_RELATION", "kg.csv") == ["sequel: 1회", "author: 3회"]
+    assert examples(report, "W_FEW_TRIPLES", "kg.csv") == ["중앙값 1"]
+    assert examples(report, "W_GIANT_AUX", "kg.csv") == ["aux_id='A1': 아이템 2 (66.7%)",
+                                                         "aux_id='A2': 아이템 1 (33.3%)"]
+
+
+@pytest.mark.parametrize("constant, value, code", [
+    ("REC_MAX_TRIPLES", 1, "W_MANY_TRIPLES"),          # I1 has 2 triples as head
+    ("REC_SINGLE_ITEM_AUX", 0.4, "W_SINGLE_ITEM_AUX"),  # 1 of 2 aux has a single item
+    ("REC_TOP_RELATION", 0.7, "W_TOP_RELATION"),        # author: 3 of 4 triples
+])
+def test_recommended_thresholds(tmp_path, monkeypatch, constant, value, code):
+    report, _ = run(tmp_path)
+    assert code not in report.codes()
+    monkeypatch.setattr(vd, constant, value)
+    report, _ = run(tmp_path / "again")
+    assert code in report.codes()
+
+
+def test_statistics(tmp_path):
+    report, _ = run(tmp_path)
+    assert report.stats["interactions.jsonl"]["사용자"] == 2
+    assert report.stats["kg.csv"]["트리플 (중복 제거, 구조 검사 통과)"] == 4
+    assert report.stats["kg.csv"]["관계별 사용"] == {"author": 3, "sequel": 1}
