@@ -12,14 +12,18 @@ Flow (design chapter 3):
         repeat [3]-[5] until a round removes no interaction in [4] or [5]
     [6] split             per user: test = max(1, R(0.2 n)), valid = max(1, R(0.1 n)), rest train
     [7] assign IDs        0-based, by sorted original ID; items then aux share node_idx
-    [8] write             (not yet)
+    [8] write             prep/<version>/: 10 files (design chapter 8), via a temporary folder
 
 Standard library only (Python 3.10+).
 """
 
 import argparse
+import csv
+import hashlib
+import json
 import math
 import random
+import shutil
 import sys
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -56,6 +60,26 @@ class Config:
             raise ValueError("user_min_interactions must be >= 3 (train / valid / test need one each)")
         if self.item_min_interactions < 1:
             raise ValueError("item_min_interactions must be >= 1")
+
+
+# meta.json "stats": always all keys, in this order, 0 when nothing happened (design 8.9)
+STATS_KEYS = (
+    "duplicate_pairs_merged",      # pairs that had more than one row
+    "duplicate_rows_merged",       # rows that disappeared by merging
+    "kg_duplicate_rows_removed",
+    "users_removed",
+    "pairs_removed",               # interactions removed by the filters
+    "items_removed",               # item filter (too few users)
+    "isolated_items_removed",      # in no KG triple
+    "aux_removed",
+    "kg_triples_removed",
+    "relations_removed",
+    "filter_rounds",
+    "split_pairs",                 # {"train": n, "valid": n, "test": n}
+)
+
+OUTPUT_FILES = ("train.txt", "valid.txt", "test.txt", "user_list.csv", "item_list.csv", "aux_list.csv",
+                "relation_list.csv", "kg.csv", "interactions.jsonl", "meta.json")
 
 
 # ---------------------------------------------------------------- working state
@@ -295,15 +319,113 @@ def assign_ids(state: State) -> Ids:
     return state.ids
 
 
+# ---------------------------------------------------------------- [8] write
+
+def file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
+def build_meta(config: Config, state: State) -> dict:
+    ids = state.ids
+    n_items, n_aux = ids.n_items, len(ids.aux)
+    return {
+        "domain": config.domain_dir.name,
+        "version": config.version,
+        "n_users": len(ids.user),
+        "n_items": n_items,
+        "n_aux": n_aux,
+        "n_relations": len(ids.relation),
+        "node_ranges": {"item": [0, n_items - 1], "aux": [n_items, n_items + n_aux - 1]},
+        "config": {
+            "seed": config.seed,
+            "split": list(config.split),
+            "rounding": config.rounding,
+            "user_min_interactions": config.user_min_interactions,
+            "item_min_interactions": config.item_min_interactions,
+        },
+        "stats": {k: state.stats.get(k, 0) for k in STATS_KEYS},
+        "input_hash": {name: file_hash(config.raw_dir / name) for name in vd.FILES},
+    }
+
+
+def write_csv(path: Path, header, rows):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def write_outputs(config: Config, state: State, out: Path):
+    """Write the 10 files of design chapter 8 into `out`. Everything is sorted and uses "\n"."""
+    ids = state.ids
+    by_idx = lambda mapping: sorted(mapping, key=mapping.get)
+
+    for part in ("train", "valid", "test"):
+        with open(out / f"{part}.txt", "w", encoding="utf-8", newline="\n") as f:
+            for u in by_idx(ids.user):
+                items = sorted(ids.item[i] for i in state.split[u][part])
+                f.write(" ".join(map(str, [ids.user[u]] + items)) + "\n")
+
+    write_csv(out / "user_list.csv", ("user_id", "user_idx"), ((u, ids.user[u]) for u in by_idx(ids.user)))
+    write_csv(out / "item_list.csv", ("item_id", "item_idx", "node_idx", "name"),
+              ((i, ids.item[i], ids.node("item", i), state.items[i]) for i in by_idx(ids.item)))
+    write_csv(out / "aux_list.csv", ("aux_id", "aux_idx", "node_idx", "name", "aux_type"),
+              ((a, ids.aux[a], ids.node("aux", a), *state.auxs[a]) for a in by_idx(ids.aux)))
+    write_csv(out / "relation_list.csv",
+              ("relation", "rel_idx", "head_type", "tail_type", "sentence", "reverse_sentence"),
+              ((r, ids.relation[r], *(state.relations[r][k] for k in ("head_type", "tail_type", "sentence",
+                                                                     "reverse_sentence")))
+               for r in by_idx(ids.relation)))
+    write_csv(out / "kg.csv", ("head", "relation", "tail"),
+              sorted((ids.node(ht, h), ids.relation[rel], ids.node(tt, t)) for ht, h, rel, tt, t in state.kg))
+
+    with open(out / "interactions.jsonl", "w", encoding="utf-8", newline="\n") as f:
+        for (u, i) in sorted(state.pairs, key=lambda k: (ids.user[k[0]], ids.item[k[1]])):
+            e = state.pairs[(u, i)]
+            row = {"user_idx": ids.user[u], "item_idx": ids.item[i], "count": e["count"], "reviews": e["reviews"]}
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    with open(out / "meta.json", "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(build_meta(config, state), ensure_ascii=False, indent=2) + "\n")
+
+
+def check_output_dir(config: Config):
+    """Design 2: never overwrite an existing version folder."""
+    if config.out_dir.exists():
+        raise FileExistsError(f"{config.out_dir} already exists (use a new --version or delete the folder)")
+
+
+def write_prep(config: Config, state: State):
+    """Write into prep/.<version>.tmp, then rename it to prep/<version>, so a failed run never
+    leaves a half-written version folder."""
+    check_output_dir(config)
+    tmp = config.out_dir.parent / f".{config.version}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)          # leftover of an interrupted run of this script
+    tmp.mkdir(parents=True)
+    write_outputs(config, state, tmp)
+    tmp.rename(config.out_dir)
+    print(f"[8] 출력: {config.out_dir} (파일 {len(OUTPUT_FILES)}개)")
+
+
 # ---------------------------------------------------------------- driver
 
-def preprocess(config: Config) -> State:
+def preprocess(config: Config, write: bool = True) -> State:
+    """Run [1]-[8]. write=False stops after [7] (nothing is written)."""
     config.check()
+    if write:
+        check_output_dir(config)    # fail before the work, not after
     data = run_validation(config.raw_dir)
     state = merge_duplicates(data)
     run_filters(state, config.user_min_interactions, config.item_min_interactions)
     split_users(state, config.seed, config.split)
     assign_ids(state)
+    if write:
+        write_prep(config, state)
     return state
 
 
@@ -331,6 +453,9 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"설정 오류: {e}")
         return 2
+    except FileExistsError as e:
+        print(f"출력 폴더 오류: {e}")
+        return 3
     return 0
 
 

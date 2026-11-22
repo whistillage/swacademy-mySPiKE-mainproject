@@ -1,3 +1,7 @@
+import csv
+import hashlib
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -60,7 +64,7 @@ def test_validation_error_stops(tmp_path, capsys):
 
 
 def test_validation_pass_prints_one_line(tmp_path, capsys):
-    pp.preprocess(config(make_domain(tmp_path)))
+    pp.preprocess(config(make_domain(tmp_path)), write=False)
     out = capsys.readouterr().out
     assert "[1] 검증 통과: 경고" in out and "== WARNING" not in out
 
@@ -185,7 +189,7 @@ def cascade_domain(tmp_path):
 
 
 def test_filters_repeat_until_nothing_changes(tmp_path):
-    state = pp.preprocess(config(cascade_domain(tmp_path)))
+    state = pp.preprocess(config(cascade_domain(tmp_path)), write=False)
     assert set(state.items) == {"I1", "I2", "I3", "I4", "I6"}
     assert {u for u, _ in state.pairs} == {"U2"}
     assert set(state.relations) == {"author"}           # sequel lost its only triple in round 1
@@ -197,7 +201,7 @@ def test_filters_repeat_until_nothing_changes(tmp_path):
 
 
 def test_result_is_a_fixed_point(tmp_path):
-    state = pp.preprocess(config(cascade_domain(tmp_path)))
+    state = pp.preprocess(config(cascade_domain(tmp_path)), write=False)
     assert pp.filter_users(state, 5) == 0
     assert pp.filter_items(state, 1) == 0
     assert pp.remove_isolated_items(state) == 0
@@ -278,6 +282,122 @@ def test_ids_do_not_depend_on_input_order(tmp_path):
     assert pp.assign_ids(a) == pp.assign_ids(b)
 
 
+# ---------------------------------------------------------------- [8] write
+
+def small_domain(tmp_path):
+    """3 users with >= 3 items each (run with user_min 3). I5 is used by nobody -> removed.
+    IDs are given out of sorted order on purpose."""
+    items = "item_id,name\nI3,Book Three\nI1,Book One\nI4,Book Four\nI2,Book Two\nI5,Unused\n"
+    auxs = "aux_id,name,aux_type\nA2,Genre Two,genre\nA1,Author One,person\nA9,Only Unused,person\n"
+    kg = ("head_type,head,relation,tail_type,tail\n"
+          "item,I1,author,aux,A1\nitem,I2,author,aux,A1\nitem,I3,author,aux,A2\nitem,I4,author,aux,A2\n"
+          "item,I5,author,aux,A9\nitem,I1,sequel,item,I2\nitem,I1,author,aux,A1\n")
+    rows = ([row("U2", i, f"u2 {i}") for i in ("I1", "I2", "I3")]
+            + [row("U1", i, f"u1 {i}") for i in ("I4", "I3", "I2", "I1")]
+            + [row("U3", i, f"u3 {i}") for i in ("I2", "I3", "I4")]
+            + [row("U1", "I1", "u1 I1 again")])
+    return make_domain(tmp_path, items__csv=items, auxs__csv=auxs, kg__csv=kg, interactions__jsonl=rows)
+
+
+def read_csv(path):
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.reader(f))
+
+
+@pytest.fixture
+def written(tmp_path):
+    domain = small_domain(tmp_path)
+    state = pp.preprocess(config(domain, user_min_interactions=3))
+    return domain / "prep" / "v1", state
+
+
+def test_writes_the_ten_files(written):
+    out, _ = written
+    assert sorted(p.name for p in out.iterdir()) == sorted(pp.OUTPUT_FILES)
+    assert not any(p.name.startswith(".") for p in out.parent.iterdir())     # temporary folder renamed
+
+
+def test_lists(written):
+    out, _ = written
+    assert read_csv(out / "user_list.csv") == [["user_id", "user_idx"], ["U1", "0"], ["U2", "1"], ["U3", "2"]]
+    assert read_csv(out / "item_list.csv") == [
+        ["item_id", "item_idx", "node_idx", "name"],
+        ["I1", "0", "0", "Book One"], ["I2", "1", "1", "Book Two"],
+        ["I3", "2", "2", "Book Three"], ["I4", "3", "3", "Book Four"]]
+    assert read_csv(out / "aux_list.csv") == [
+        ["aux_id", "aux_idx", "node_idx", "name", "aux_type"],
+        ["A1", "0", "4", "Author One", "person"], ["A2", "1", "5", "Genre Two", "genre"]]
+    assert read_csv(out / "relation_list.csv")[1:] == [
+        ["author", "0", "item", "aux", "{head} lists {tails} as its author", "{tail} is credited as the author of {head}"],
+        ["sequel", "1", "item", "item", "{head} is followed by {tails}", "{tail} is the sequel to {head}"]]
+
+
+def test_kg_uses_node_and_relation_numbers(written):
+    out, _ = written
+    assert read_csv(out / "kg.csv") == [
+        ["head", "relation", "tail"],
+        ["0", "0", "4"], ["0", "1", "1"], ["1", "0", "4"], ["2", "0", "5"], ["3", "0", "5"]]
+
+
+def test_split_files(written):
+    out, state = written
+    lines = {part: (out / f"{part}.txt").read_text(encoding="utf-8").splitlines() for part in ("train", "valid", "test")}
+    users = {"U1": {0, 1, 2, 3}, "U2": {0, 1, 2}, "U3": {1, 2, 3}}
+    for uidx, (u, items) in enumerate(sorted(users.items())):
+        got = []
+        for part in ("train", "valid", "test"):
+            fields = list(map(int, lines[part][uidx].split()))
+            assert fields[0] == uidx and fields[1:] == sorted(fields[1:]) and len(fields) > 1
+            got += fields[1:]
+        assert sorted(got) == sorted(items)                              # every item exactly once
+    assert [len(lines[p]) for p in lines] == [3, 3, 3]
+
+
+def test_interactions_file(written):
+    out, _ = written
+    rows = [json.loads(line) for line in (out / "interactions.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [(r["user_idx"], r["item_idx"]) for r in rows] == [
+        (0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)]
+    assert rows[0] == {"user_idx": 0, "item_idx": 0, "count": 2,
+                       "reviews": [{"text": "u1 I1"}, {"text": "u1 I1 again"}]}
+
+
+def test_meta(written):
+    out, _ = written
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert list(meta) == ["domain", "version", "n_users", "n_items", "n_aux", "n_relations", "node_ranges",
+                          "config", "stats", "input_hash"]
+    assert (meta["domain"], meta["version"], meta["n_users"], meta["n_items"], meta["n_aux"], meta["n_relations"]) == (
+        "dom", "v1", 3, 4, 2, 2)
+    assert meta["node_ranges"] == {"item": [0, 3], "aux": [4, 5]}
+    assert meta["config"] == {"seed": 2020, "split": [0.7, 0.1, 0.2], "rounding": "half_up",
+                              "user_min_interactions": 3, "item_min_interactions": 1}
+    assert list(meta["stats"]) == list(pp.STATS_KEYS)                    # every key, fixed order
+    assert meta["stats"]["isolated_items_removed"] == 0                  # zero, not missing
+    assert (meta["stats"]["items_removed"], meta["stats"]["aux_removed"], meta["stats"]["duplicate_rows_merged"],
+            meta["stats"]["kg_duplicate_rows_removed"]) == (1, 1, 1, 1)
+    raw = out.parent.parent / "raw"
+    assert meta["input_hash"] == {n: "sha256:" + hashlib.sha256((raw / n).read_bytes()).hexdigest()
+                                  for n in ("interactions.jsonl", "items.csv", "auxs.csv", "kg.csv", "relations.csv")}
+
+
+def test_existing_version_is_not_overwritten(written, capsys):
+    out, _ = written
+    before = (out / "meta.json").read_bytes()
+    assert pp.main([str(out.parent.parent), "--version", "v1", "--user-min", "3"]) == 3
+    assert "[1] 검증" not in capsys.readouterr().out                     # stopped before any work
+    assert (out / "meta.json").read_bytes() == before
+
+
+def test_leftover_temporary_folder_is_replaced(tmp_path):
+    domain = small_domain(tmp_path)
+    leftover = domain / "prep" / ".v1.tmp"
+    leftover.mkdir(parents=True)
+    (leftover / "junk.txt").write_text("x")
+    pp.preprocess(config(domain, user_min_interactions=3))
+    assert not leftover.exists() and not (domain / "prep" / "v1" / "junk.txt").exists()
+
+
 # ---------------------------------------------------------------- real data
 
 def domain_or_skip(name):
@@ -292,8 +412,8 @@ def structure(state):
 
 
 def test_noisy_book_cleans_to_book():
-    book = pp.preprocess(config(domain_or_skip("book")))
-    noisy = pp.preprocess(config(domain_or_skip("book_noisy")))
+    book = pp.preprocess(config(domain_or_skip("book")), write=False)
+    noisy = pp.preprocess(config(domain_or_skip("book_noisy")), write=False)
     assert (len(book.pairs), len(book.items), len(book.auxs), len(book.relations), len(book.kg)) == (
         169_273, 8_475, 23_330, 20, 65_190)
     for name, b, n in zip(("pairs", "items", "auxs", "relations", "kg"), structure(book), structure(noisy)):
@@ -306,3 +426,18 @@ def test_noisy_book_cleans_to_book():
     assert (len(book.ids.user), book.ids.n_items, len(book.ids.aux), len(book.ids.relation)) == (14_946, 8_475, 23_330, 20)
     assert book.ids.node("aux", max(book.ids.aux, key=book.ids.aux.get)) == 31_804
     assert book.stats["split_pairs"] == {"train": 115_376, "valid": 20_686, "test": 33_211}   # 68.2 / 12.2 / 19.6
+
+
+def test_real_book_write(tmp_path):
+    """Run on the real raw files (linked, so nothing is written under data/)."""
+    raw = domain_or_skip("book") / "raw"
+    domain = tmp_path / "book"
+    domain.mkdir()
+    os.symlink(raw.resolve(), domain / "raw")
+    pp.preprocess(config(domain))
+    out = domain / "prep" / "v1"
+    assert [len((out / f"{p}.txt").read_text().splitlines()) for p in ("train", "valid", "test")] == [14_946] * 3
+    assert len(read_csv(out / "kg.csv")) == 65_190 + 1
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["node_ranges"] == {"item": [0, 8474], "aux": [8475, 31804]}
+    assert meta["stats"]["split_pairs"] == {"train": 115_376, "valid": 20_686, "test": 33_211}
