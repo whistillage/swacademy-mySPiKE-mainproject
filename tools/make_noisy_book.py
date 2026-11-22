@@ -35,7 +35,13 @@ relations.csv (appended):
   Once those items are removed it has no triples left -> removed (KG cleanup step 4).
   Until the kg.csv injector exists it is simply an unused relation (a warning).
 
-items.csv, auxs.csv, kg.csv: not yet (copied unchanged).
+items.csv (appended):
+  Phantom items with no interactions -> removed by the item filter. They are added after
+  the interactions injector ran, so no fake user touches them.
+  Intermediate state: they get their triples only from the kg.csv injector; until then
+  they violate required condition 1 (every item has a 1-hop neighbour) -> validation error.
+
+auxs.csv, kg.csv: not yet (copied unchanged).
 
 Phantom items (planned across relations -> items -> auxs -> kg): items with no
 interactions, plus aux / relations / triples that only they use, so that removing them
@@ -60,6 +66,10 @@ N_TRIPLE_PAIRS = 50        # ... of which appear three times in total
 N_SMALL_USERS = 300        # 1-4 distinct items
 N_TRAP_USERS = 100         # 4 distinct items + 1 duplicate row
 NEW_USER_PREFIX = "NOISY_U"
+
+# items.csv
+N_PHANTOM_ITEMS = 50
+PHANTOM_ITEM_PREFIX = "NOISY_I"
 
 # relations.csv
 PHANTOM_RELATIONS = [
@@ -94,6 +104,8 @@ def check_book_assumptions(data: dict):
         sys.exit("no item without interactions; book has 221. Is this the book data?")
     if any(r["user_id"].startswith(NEW_USER_PREFIX) for r in rows):
         sys.exit(f"user IDs already use the prefix {NEW_USER_PREFIX!r}")
+    if any(r["item_id"].startswith(PHANTOM_ITEM_PREFIX) for r in items):
+        sys.exit(f"item IDs already use the prefix {PHANTOM_ITEM_PREFIX!r}")
     existing_relations = {r["relation"] for r in data["relations"]}
     if any(r["relation"] in existing_relations for r in PHANTOM_RELATIONS):
         sys.exit("phantom relation name already exists in relations.csv")
@@ -214,12 +226,28 @@ def inject_relations(data: dict, rng: random.Random) -> dict:
     }
 
 
+def inject_items(data: dict, rng: random.Random) -> dict:
+    """Phantom items without interactions. Returns manifest part."""
+    clean = len(data["items"])
+    new = [{"item_id": f"{PHANTOM_ITEM_PREFIX}{k:04d}", "name": f"Noisy Phantom Book {k:04d}"}
+           for k in range(N_PHANTOM_ITEMS)]
+    data["items"] = data["items"] + new
+    data["phantom"]["items"] = [r["item_id"] for r in new]
+    return {
+        "summary": {"clean_rows": clean, "noisy_rows": clean + len(new), "phantom_items": len(new)},
+        "phantom_items": [r["item_id"] for r in new],
+    }
+
+
 # (file name, injector, writer). Order matters: later injectors see earlier changes.
+# interactions first: its fake users pick from the clean items only, never phantom items.
 INJECTORS = (
     ("interactions.jsonl", inject_interactions,
      lambda data, path: write_jsonl(path, data["interactions"])),
     ("relations.csv", inject_relations,
      lambda data, path: write_csv(path, data["relations"])),
+    ("items.csv", inject_items,
+     lambda data, path: write_csv(path, data["items"])),
 )
 
 

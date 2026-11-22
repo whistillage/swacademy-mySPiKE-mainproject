@@ -87,6 +87,21 @@ def test_relations_phantom_appended(noisy_all):
             assert "'" not in t and '"' not in t and not t.endswith(".")
 
 
+def test_items_phantom_appended(noisy_all):
+    out, summary = noisy_all
+    assert (out / "raw/items.csv").read_bytes().startswith((CLEAN_RAW / "items.csv").read_bytes())
+
+    with open(out / "raw/items.csv", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    new = rows[8_696:]
+    assert summary["items.csv"] == {"clean_rows": 8_696, "noisy_rows": 8_746, "phantom_items": 50}
+    assert all(r["item_id"].startswith(mn.PHANTOM_ITEM_PREFIX) and r["name"] for r in new)
+    assert len({r["item_id"] for r in rows}) == len(rows)   # spec: no duplicate item_id
+
+    used = {i for _, i, _ in pairs_of(out / "raw/interactions.jsonl")}
+    assert not used & {r["item_id"] for r in new}            # phantom items have no interactions
+
+
 def test_untouched_files_copied_unchanged(noisy):
     out, _ = noisy
     assert sorted(p.name for p in (out / "raw").iterdir()) == sorted(mn.SPEC_FILES)
