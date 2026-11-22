@@ -24,6 +24,13 @@ mySPiKE/
 - Python 3.10 이상. `validate_dataset.py`, `preprocess.py`는 **표준 라이브러리만** 사용한다 (구축팀이 별도 설치 없이 실행 가능).
 - 테스트: `pip install -r requirements.txt` 후 `pytest`
 
+## 사용법
+
+```bash
+# 저자 book 데이터 -> 명세 형식 5개 파일 (data/book/raw/)
+python tools/convert_book.py ../SPiKE/spike/datasets/kg/amazon-book_kg data/book/raw
+```
+
 ## 문서 (`docs/`)
 
 | 문서 | 내용 |
