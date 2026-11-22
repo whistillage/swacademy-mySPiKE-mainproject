@@ -41,7 +41,13 @@ items.csv (appended):
   Intermediate state: they get their triples only from the kg.csv injector; until then
   they violate required condition 1 (every item has a 1-hop neighbour) -> validation error.
 
-auxs.csv, kg.csv: not yet (copied unchanged).
+auxs.csv (appended):
+  Phantom aux linked only to phantom items -> removed once nothing links them to a
+  remaining item (KG cleanup step 2). IDs follow the book convention (res:..., resource).
+  Intermediate state: until the kg.csv injector links them they violate required
+  condition 2 (every aux is directly linked to an item) -> validation error.
+
+kg.csv: not yet (copied unchanged).
 
 Phantom items (planned across relations -> items -> auxs -> kg): items with no
 interactions, plus aux / relations / triples that only they use, so that removing them
@@ -70,6 +76,10 @@ NEW_USER_PREFIX = "NOISY_U"
 # items.csv
 N_PHANTOM_ITEMS = 50
 PHANTOM_ITEM_PREFIX = "NOISY_I"
+
+# auxs.csv
+N_PHANTOM_AUX = 30
+PHANTOM_AUX_PREFIX = "res:Noisy_Phantom_Aux_"
 
 # relations.csv
 PHANTOM_RELATIONS = [
@@ -106,6 +116,8 @@ def check_book_assumptions(data: dict):
         sys.exit(f"user IDs already use the prefix {NEW_USER_PREFIX!r}")
     if any(r["item_id"].startswith(PHANTOM_ITEM_PREFIX) for r in items):
         sys.exit(f"item IDs already use the prefix {PHANTOM_ITEM_PREFIX!r}")
+    if any(r["aux_id"].startswith(PHANTOM_AUX_PREFIX) for r in data["auxs"]):
+        sys.exit(f"aux IDs already use the prefix {PHANTOM_AUX_PREFIX!r}")
     existing_relations = {r["relation"] for r in data["relations"]}
     if any(r["relation"] in existing_relations for r in PHANTOM_RELATIONS):
         sys.exit("phantom relation name already exists in relations.csv")
@@ -116,6 +128,7 @@ def load_raw(raw: Path) -> dict:
     return {
         "interactions": read_jsonl(raw / "interactions.jsonl"),
         "items": read_csv(raw / "items.csv"),
+        "auxs": read_csv(raw / "auxs.csv"),
         "relations": read_csv(raw / "relations.csv"),
         "phantom": {},
     }
@@ -239,6 +252,19 @@ def inject_items(data: dict, rng: random.Random) -> dict:
     }
 
 
+def inject_auxs(data: dict, rng: random.Random) -> dict:
+    """Phantom aux used only by phantom items. Returns manifest part."""
+    clean = len(data["auxs"])
+    new = [{"aux_id": f"{PHANTOM_AUX_PREFIX}{k:04d}", "name": f"Noisy Phantom Aux {k:04d}",
+            "aux_type": "resource"} for k in range(N_PHANTOM_AUX)]
+    data["auxs"] = data["auxs"] + new
+    data["phantom"]["auxs"] = [r["aux_id"] for r in new]
+    return {
+        "summary": {"clean_rows": clean, "noisy_rows": clean + len(new), "phantom_aux": len(new)},
+        "phantom_aux": [r["aux_id"] for r in new],
+    }
+
+
 # (file name, injector, writer). Order matters: later injectors see earlier changes.
 # interactions first: its fake users pick from the clean items only, never phantom items.
 INJECTORS = (
@@ -248,6 +274,8 @@ INJECTORS = (
      lambda data, path: write_csv(path, data["relations"])),
     ("items.csv", inject_items,
      lambda data, path: write_csv(path, data["items"])),
+    ("auxs.csv", inject_auxs,
+     lambda data, path: write_csv(path, data["auxs"])),
 )
 
 

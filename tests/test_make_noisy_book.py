@@ -102,6 +102,19 @@ def test_items_phantom_appended(noisy_all):
     assert not used & {r["item_id"] for r in new}            # phantom items have no interactions
 
 
+def test_auxs_phantom_appended(noisy_all):
+    out, summary = noisy_all
+    assert (out / "raw/auxs.csv").read_bytes().startswith((CLEAN_RAW / "auxs.csv").read_bytes())
+
+    with open(out / "raw/auxs.csv", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    new = rows[23_867:]
+    assert summary["auxs.csv"] == {"clean_rows": 23_867, "noisy_rows": 23_897, "phantom_aux": 30}
+    assert all(r["aux_id"].startswith(mn.PHANTOM_AUX_PREFIX) and r["name"] for r in new)
+    assert {r["aux_type"] for r in new} == {"resource"}      # same rule as convert_book (res:)
+    assert len({r["aux_id"] for r in rows}) == len(rows)     # spec: no duplicate aux_id
+
+
 def test_untouched_files_copied_unchanged(noisy):
     out, _ = noisy
     assert sorted(p.name for p in (out / "raw").iterdir()) == sorted(mn.SPEC_FILES)
