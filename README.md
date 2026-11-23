@@ -49,3 +49,4 @@ python tools/make_noisy_book.py data/book/raw data/book_noisy
 | SPiKE_데이터_전처리_설계서 | Step 2 설계 |
 | SPiKE_데이터_디렉토리_규약 | data/ 폴더 구조 |
 | SPiKE_데이터_전처리_구현_결과_보고서 | 검증·전처리 구현과 확인 결과 |
+| SPiKE_LLM_프로필_설계서 | Step 3 원시·LLM 프로필 설계 |
