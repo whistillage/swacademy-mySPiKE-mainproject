@@ -4,6 +4,9 @@
 # Paper PDF: not redistributed in this public repo
 /docs/SPiKE.pdf
 
+# Data archives handed over by the data team (contents go to data/)
+*.zip
+
 # Python
 __pycache__/
 *.py[cod]
