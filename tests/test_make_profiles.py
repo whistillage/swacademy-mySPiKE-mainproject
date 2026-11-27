@@ -1,9 +1,14 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import make_profiles as mp
+import preprocess as pp
+from dataset_fixtures import write_raw
 
 ROOT = Path(__file__).resolve().parent.parent
 GOOD = {"seed": 2020, "item_review_cap": 5}
@@ -125,9 +130,6 @@ def test_unknown_stage_rejected_by_argparse():
 
 
 # ---------------------------------------------------------------- prep input
-
-import preprocess as pp
-from dataset_fixtures import write_raw
 
 # 3 users x 3-4 items, so user_min 3 keeps everyone and each user has 1 train / 1 valid / 1 test
 # (U3 has 4: 2 train). U1 reviewed I3 twice (duplicate rows merge into one pair).
@@ -263,3 +265,102 @@ def test_main_prep_error_exit_code(toy_prep, tmp_path, monkeypatch, capsys):
     assert mp.main([str(toy_prep.parent.parent), "--prep", "v1", "--config", str(config),
                     "--stage", "item_raw"]) == 3
     assert "prep 오류" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- sentences and sampling
+
+def small_prep(relations, item_names, aux_names=()) -> mp.Prep:
+    return mp.Prep(meta={}, item_ids=[f"I{i}" for i in range(len(item_names))], item_names=list(item_names),
+                   aux_names=list(aux_names), user_ids=[], relations=relations, kg=[], item_reviews={})
+
+
+REL_AUTHOR = mp.Relation("author", "item", "aux", "{head} lists {tails} as its author",
+                         "{tail} is credited as the author of {head}")
+REL_GENRE = mp.Relation("genre", "item", "aux", "{head} is about {tails}", "{tail} is the subject of {head}")
+REL_SEQUEL = mp.Relation("sequel", "item", "item", "{head} is followed by {tails}", "{tail} is the sequel to {head}")
+
+
+def test_quote_keeps_inner_quotes():
+    assert mp.quote("Ender's Game") == "'Ender's Game'"
+
+
+@pytest.mark.parametrize("names, expected", [
+    (["'A'"], "'A'"),
+    (["'A'", "'B'"], "'A', and 'B'"),
+    (["'A'", "'B'", "'C'"], "'A', 'B', and 'C'"),
+])
+def test_join_names(names, expected):
+    assert mp.join_names(names) == expected
+
+
+@pytest.mark.parametrize("template, expected", [
+    ("{head} lists {tails} as its author", "'W' lists 'M' as its author."),
+    ("{head} lists {tails} as its author.", "'W' lists 'M' as its author."),       # no '..'
+    ("{head} lists {tails} as its author . ", "'W' lists 'M' as its author."),
+    ("{head} lists {tails} {x}", "'W' lists 'M' {x}."),                           # other braces untouched
+])
+def test_fill(template, expected):
+    assert mp.fill(template, head="'W'", tails="'M'") == expected
+
+
+def test_forward_sentences_group_by_relation():
+    # items 0-1, aux 2-5. rel_idx: 0 author, 1 genre
+    p = small_prep([REL_AUTHOR, REL_GENRE], ["Wicked", "Son"], ["Oz", "Witchcraft", "Maguire", "Oz"])
+    edges = [(1, 3), (0, 4), (1, 5), (1, 2)]          # given in a scrambled order
+    assert mp.forward_sentences(p, 0, edges) == [
+        "'Wicked' lists 'Maguire' as its author.",      # rel 0 before rel 1
+        "'Wicked' is about 'Oz', 'Oz', and 'Witchcraft'.",   # name order; equal names by node_idx
+    ]
+
+
+def test_forward_sentences_equal_names_tie_by_node():
+    p = small_prep([REL_GENRE], ["W"], ["Same", "Same"])
+    # nodes 1 and 2 share a name; the order must not depend on the input order
+    assert mp.forward_sentences(p, 0, [(0, 2), (0, 1)]) == mp.forward_sentences(p, 0, [(0, 1), (0, 2)])
+
+
+def test_forward_sentences_empty():
+    assert mp.forward_sentences(small_prep([REL_AUTHOR], ["W"]), 0, []) == []
+
+
+def test_reverse_sentences_one_per_triple():
+    # items 0-2. rel_idx: 0 author (unused), 1 sequel. Item 0 is the sequel to items 2 and 1.
+    p = small_prep([REL_AUTHOR, REL_SEQUEL], ["Circus", "Breakheart Pass", "Alpha"])
+    assert mp.reverse_sentences(p, 0, [(1, 1), (2, 1)]) == [
+        "'Circus' is the sequel to 'Alpha'.",
+        "'Circus' is the sequel to 'Breakheart Pass'.",
+    ]
+
+
+def test_entity_rng_is_per_entity_and_kind():
+    a = mp.entity_rng(2020, "item", "X").random()
+    assert a == mp.entity_rng(2020, "item", "X").random()
+    assert a != mp.entity_rng(2020, "user", "X").random()
+    assert a != mp.entity_rng(2020, "item", "Y").random()
+    assert a != mp.entity_rng(2021, "item", "X").random()
+
+
+def test_pick_pinned_values():
+    """Pins the exact selection: a change here changes every profile made so far."""
+    assert mp.pick(list(range(10)), 3, mp.entity_rng(2020, "item", "000100039X")) == [3, 4, 9]
+    assert mp.pick(list(range(10)), 3, mp.entity_rng(2020, "user", "000100039X")) == [7, 0, 3]
+
+
+def test_pick_independent_of_hash_seed():
+    code = ("import make_profiles as mp; "
+            "print(mp.pick(list(range(100)), 5, mp.entity_rng(2020, 'item', 'abc')))")
+    outs = {subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=True,
+                           env={**os.environ, "PYTHONHASHSEED": h}).stdout for h in ("0", "1", "12345")}
+    assert len(outs) == 1
+
+
+def test_pick_all_when_few():
+    rng = mp.entity_rng(2020, "item", "X")
+    assert mp.pick(["c", "a", "b"], 3, rng) == ["c", "a", "b"]   # input order kept
+    assert mp.pick([], 5, rng) == []
+
+
+def test_pick_sample_when_many():
+    got = mp.pick(list("abcdefgh"), 5, mp.entity_rng(2020, "item", "X"))
+    assert len(got) == 5 and len(set(got)) == 5 and set(got) <= set("abcdefgh")
+    assert mp.pick(list("abc"), 0, mp.entity_rng(2020, "item", "X")) == []

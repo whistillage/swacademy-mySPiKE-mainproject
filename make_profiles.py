@@ -15,6 +15,7 @@ Standard library only (Python 3.10+) for the raw-profile stages.
 import argparse
 import csv
 import json
+import random
 import re
 import sys
 from dataclasses import dataclass
@@ -195,6 +196,71 @@ def load_prep(prep_dir: Path) -> Prep:
                 item_ids=[r["item_id"] for r in items], item_names=[r["name"] for r in items],
                 aux_names=[r["name"] for r in auxs], user_ids=[r["user_id"] for r in users],
                 relations=relations, kg=kg, item_reviews=item_reviews)
+
+
+# ---------------------------------------------------------------- sentences and sampling
+
+def quote(name: str) -> str:
+    """Design 4.1: names in single quotes. Quotes inside the name are kept as they are."""
+    return f"'{name}'"
+
+
+def join_names(quoted: list) -> str:
+    """'A' / 'A', and 'B' / 'A', 'B', and 'C' (design 4.1: the author's format, comma even for two)."""
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + ", and " + quoted[-1]
+
+
+def fill(template: str, **values: str) -> str:
+    """Fill {head} / {tails} / {tail} and end with one '.'. A '.' already at the end of the template
+    (validate_dataset only warns about it) is dropped first so it never doubles.
+    str.replace, not str.format: other braces in a template must not break it."""
+    text = template.rstrip()
+    if text.endswith("."):
+        text = text[:-1].rstrip()
+    for key, value in values.items():
+        text = text.replace("{" + key + "}", value)
+    return text + "."
+
+
+def name_order(prep: Prep, node: int) -> tuple:
+    """Sort key: name by Unicode code point (design 4.1), node_idx breaks ties between equal names."""
+    return prep.node_name(node), node
+
+
+def forward_sentences(prep: Prep, head: int, edges: list) -> list:
+    """Sentences for triples with this head: one per relation, its tails joined (design 4.1).
+    edges: [(rel_idx, tail node_idx)]. Relations in rel_idx order, tails in name order."""
+    by_rel = {}
+    for rel, tail in edges:
+        by_rel.setdefault(rel, []).append(tail)
+    head_name = quote(prep.node_name(head))
+    return [fill(prep.relations[rel].sentence, head=head_name,
+                 tails=join_names([quote(prep.node_name(t)) for t in sorted(tails, key=lambda n: name_order(prep, n))]))
+            for rel, tails in sorted(by_rel.items())]
+
+
+def reverse_sentences(prep: Prep, tail: int, edges: list) -> list:
+    """Sentences for triples with this tail: one per triple (design 4.1).
+    edges: [(head node_idx, rel_idx)]. Relations in rel_idx order, heads in name order."""
+    tail_name = quote(prep.node_name(tail))
+    return [fill(prep.relations[rel].reverse_sentence, tail=tail_name, head=quote(prep.node_name(head)))
+            for head, rel in sorted(edges, key=lambda e: (e[1], name_order(prep, e[0])))]
+
+
+def entity_rng(seed: int, kind: str, entity_id: str) -> random.Random:
+    """Design 4.3: one generator per entity, seeded by the string "<seed>:<kind>:<original ID>".
+    A str seed does not depend on PYTHONHASHSEED, the processing order or other entities."""
+    return random.Random(f"{seed}:{kind}:{entity_id}")
+
+
+def pick(candidates: list, cap: int, rng: random.Random) -> list:
+    """Design 4.3: candidates come already sorted. Up to `cap` of them: all, in that order, when
+    there are no more than `cap`; otherwise rng.sample, in the order sample returns."""
+    if len(candidates) <= cap:
+        return list(candidates)
+    return rng.sample(candidates, cap)
 
 
 # ---------------------------------------------------------------- run
