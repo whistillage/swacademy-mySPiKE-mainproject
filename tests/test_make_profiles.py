@@ -364,3 +364,63 @@ def test_pick_sample_when_many():
     got = mp.pick(list("abcdefgh"), 5, mp.entity_rng(2020, "item", "X"))
     assert len(got) == 5 and len(set(got)) == 5 and set(got) <= set("abcdefgh")
     assert mp.pick(list("abc"), 0, mp.entity_rng(2020, "item", "X")) == []
+
+
+# ---------------------------------------------------------------- item raw profiles
+
+def test_build_item_raw_profiles(toy_prep):
+    p = mp.load_prep(toy_prep)
+    assert mp.build_item_raw_profiles(p, seed=2020, review_cap=5) == [
+        # no train review: KG sentences only
+        "'Book One' lists 'Author One' as its author. 'Book One' is followed by 'Book Two'.",
+        # reverse item -> item sentence after the forward ones
+        "'Book Two' lists 'Author One' as its author. 'Book Two' is the sequel to 'Book One'. "
+        "Some users say: 'u2 on i2'",
+        # every review is a unit (U1's two merged reviews too), sorted by user_id then list order
+        "'Book Three' lists 'Genre Two' as its author. "
+        "Some users say: 'u1 on i3 first', 'u1 on i3 second', 'u3 on i3'",
+        "'Book Four' lists 'Genre Two' as its author. Some users say: 'u3 on i4'",
+    ]
+
+
+def test_item_raw_review_cap(toy_prep):
+    p = mp.load_prep(toy_prep)
+    capped = mp.build_item_raw_profiles(p, seed=2020, review_cap=2)
+    got = capped[2].split("Some users say: ")[1]
+    assert got.count("', '") == 1                     # two reviews
+    assert capped == mp.build_item_raw_profiles(p, seed=2020, review_cap=2)   # same every time
+    none = mp.build_item_raw_profiles(p, seed=2020, review_cap=0)
+    assert all("Some users say" not in t for t in none)
+
+
+def test_item_raw_review_order_follows_user_id_and_selection_is_per_item(toy_prep):
+    p = mp.load_prep(toy_prep)
+    units = mp.review_units(p, 2)
+    assert units == ["u1 on i3 first", "u1 on i3 second", "u3 on i3"]
+    # the selection uses the item's own generator, seeded by its original ID
+    expected = mp.pick(units, 2, mp.entity_rng(2020, "item", "I3"))
+    assert mp.build_item_raw_profiles(p, 2020, 2)[2].endswith(", ".join(f"'{r}'" for r in expected))
+
+
+def test_item_raw_quotes_in_reviews_kept():
+    p = small_prep([REL_AUTHOR], ["W"], ["M"])
+    p.user_ids = ["U1"]
+    p.item_reviews = {0: [(0, ["it's 'great'"])]}
+    assert mp.item_raw_profile(p, 0, [(0, 1)], [], 2020, 5) == \
+        "'W' lists 'M' as its author. Some users say: 'it's 'great''"
+
+
+def test_item_raw_only_as_item_tail():
+    """An item that is only the tail of item -> item triples gets reverse sentences only."""
+    p = small_prep([REL_SEQUEL], ["Circus", "Breakheart Pass"])
+    p.kg = [(1, 0, 0)]                               # Breakheart Pass is followed by Circus
+    assert mp.build_item_raw_profiles(p, 2020, 5) == [
+        "'Circus' is the sequel to 'Breakheart Pass'.",
+        "'Breakheart Pass' is followed by 'Circus'.",
+    ]
+
+
+def test_item_raw_empty_profile_is_prep_error():
+    p = small_prep([REL_AUTHOR], ["W"])
+    with pytest.raises(mp.PrepError, match="I0"):
+        mp.build_item_raw_profiles(p, 2020, 5)

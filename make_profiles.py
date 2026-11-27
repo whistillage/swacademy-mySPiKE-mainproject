@@ -263,6 +263,43 @@ def pick(candidates: list, cap: int, rng: random.Random) -> list:
     return rng.sample(candidates, cap)
 
 
+# ---------------------------------------------------------------- item raw profiles
+
+def review_units(prep: Prep, item: int) -> list:
+    """Design 5.1: every review on a train pair of this item is one candidate, sorted by
+    (the reviewer's user_id, position in that pair's reviews list). Only the text is used."""
+    pairs = sorted(prep.item_reviews.get(item, []), key=lambda e: prep.user_ids[e[0]])
+    return [text for _, texts in pairs for text in texts]
+
+
+def item_raw_profile(prep: Prep, item: int, forward: list, reverse: list, seed: int, review_cap: int) -> str:
+    """Design 5.1: forward sentences, reverse sentences, reviews, joined by one space.
+    forward: [(rel_idx, tail)] of triples with this item as head (item -> aux, item -> item).
+    reverse: [(head item, rel_idx)] of item -> item triples with this item as tail.
+    Reviews are used as they are: no cutting, quotes kept (the 6.4 trimming belongs to the LLM stage)."""
+    parts = forward_sentences(prep, item, forward) + reverse_sentences(prep, item, reverse)
+    rng = entity_rng(seed, "item", prep.item_ids[item])
+    reviews = pick(review_units(prep, item), review_cap, rng)
+    if reviews:
+        parts.append("Some users say: " + ", ".join(quote(r) for r in reviews))
+    if not parts:
+        # every item is in at least one triple (spec required condition 1, preprocessing 5.5)
+        raise PrepError(f"item {prep.item_ids[item]}: 트리플도 train 리뷰도 없어 프로필을 만들 수 없습니다")
+    return " ".join(parts)
+
+
+def build_item_raw_profiles(prep: Prep, seed: int, review_cap: int) -> list:
+    """Item raw profile texts, indexed by item_idx."""
+    forward = [[] for _ in range(prep.n_items)]
+    reverse = [[] for _ in range(prep.n_items)]
+    for head, rel, tail in prep.kg:
+        if prep.is_item(head):
+            forward[head].append((rel, tail))
+            if prep.is_item(tail):
+                reverse[tail].append((head, rel))
+    return [item_raw_profile(prep, i, forward[i], reverse[i], seed, review_cap) for i in range(prep.n_items)]
+
+
 # ---------------------------------------------------------------- run
 
 @dataclass(frozen=True)
