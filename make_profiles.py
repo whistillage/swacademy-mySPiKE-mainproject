@@ -13,6 +13,7 @@ Standard library only (Python 3.10+) for the raw-profile stages.
 """
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -79,6 +80,123 @@ def load_settings(path: Path) -> Settings:
     return Settings(**data)
 
 
+# ---------------------------------------------------------------- prep input
+
+class PrepError(Exception):
+    """prep/<version>/ is missing a file or is inconsistent (exit code 3)."""
+
+
+@dataclass(frozen=True)
+class Relation:
+    name: str
+    head_type: str          # "item" or "aux"
+    tail_type: str
+    sentence: str           # {head} ... {tails}
+    reverse_sentence: str   # {tail} ... {head}
+
+
+@dataclass
+class Prep:
+    """What the item raw profiles need from prep/<version>/. Lists are indexed by *_idx."""
+    meta: dict
+    item_ids: list          # item_idx -> item_id
+    item_names: list        # item_idx -> name
+    aux_names: list         # aux_idx -> name
+    user_ids: list          # user_idx -> user_id
+    relations: list         # rel_idx -> Relation
+    kg: list                # [(head node_idx, rel_idx, tail node_idx)] as in kg.csv
+    item_reviews: dict      # item_idx -> [(user_idx, [review text, ...])], train pairs only
+
+    @property
+    def n_items(self) -> int:
+        return len(self.item_ids)
+
+    def is_item(self, node: int) -> bool:
+        return node < self.n_items
+
+    def node_name(self, node: int) -> str:
+        return self.item_names[node] if self.is_item(node) else self.aux_names[node - self.n_items]
+
+
+def read_csv_rows(path: Path) -> list:
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+    except FileNotFoundError:
+        raise PrepError(f"prep 파일이 없습니다: {path}") from None
+
+
+def check_indexed(rows: list, idx_key: str, expected: int, path: Path):
+    """Rows must be in *_idx order 0..n-1 and their number must match meta.json."""
+    if len(rows) != expected:
+        raise PrepError(f"{path.name}: 행 수 {len(rows)}가 meta.json의 개수 {expected}와 다릅니다")
+    for pos, row in enumerate(rows):
+        if int(row[idx_key]) != pos:
+            raise PrepError(f"{path.name}: {pos + 2}행의 {idx_key}가 {row[idx_key]}입니다 ({pos}이어야 함)")
+
+
+def load_prep(prep_dir: Path) -> Prep:
+    """Read prep/<version>/ with light consistency checks (counts, contiguous *_idx, node and
+    relation ranges, every train pair present in interactions.jsonl). Keeps only the review text
+    of train pairs: valid / test reviews must not reach the profiles (design 1.4, 5.1)."""
+    try:
+        with open(prep_dir / "meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+    except FileNotFoundError:
+        raise PrepError(f"prep 파일이 없습니다: {prep_dir / 'meta.json'}") from None
+    n_items, n_aux = meta["n_items"], meta["n_aux"]
+
+    items = read_csv_rows(prep_dir / "item_list.csv")
+    check_indexed(items, "item_idx", n_items, prep_dir / "item_list.csv")
+    auxs = read_csv_rows(prep_dir / "aux_list.csv")
+    check_indexed(auxs, "aux_idx", n_aux, prep_dir / "aux_list.csv")
+    if any(int(r["node_idx"]) != int(r["item_idx"]) for r in items) or \
+            any(int(r["node_idx"]) != n_items + int(r["aux_idx"]) for r in auxs):
+        raise PrepError("item_list.csv / aux_list.csv: node_idx가 규칙(아이템 먼저, aux는 아이템 수 + aux_idx)과 다릅니다")
+    users = read_csv_rows(prep_dir / "user_list.csv")
+    check_indexed(users, "user_idx", meta["n_users"], prep_dir / "user_list.csv")
+    rels = read_csv_rows(prep_dir / "relation_list.csv")
+    check_indexed(rels, "rel_idx", meta["n_relations"], prep_dir / "relation_list.csv")
+    relations = [Relation(r["relation"], r["head_type"], r["tail_type"], r["sentence"], r["reverse_sentence"])
+                 for r in rels]
+
+    n_nodes = n_items + n_aux
+    kg = [(int(r["head"]), int(r["relation"]), int(r["tail"])) for r in read_csv_rows(prep_dir / "kg.csv")]
+    for h, rel, t in kg:
+        if not (0 <= h < n_nodes and 0 <= t < n_nodes and 0 <= rel < len(relations)):
+            raise PrepError(f"kg.csv: 범위를 벗어난 값이 있습니다 ({h}, {rel}, {t})")
+
+    train = set()
+    try:
+        with open(prep_dir / "train.txt", encoding="utf-8") as f:
+            for line in f:
+                u, *its = map(int, line.split())
+                if not 0 <= u < len(users) or any(not 0 <= i < n_items for i in its):
+                    raise PrepError(f"train.txt: 범위를 벗어난 번호가 있습니다 (user_idx {u})")
+                train.update((u, i) for i in its)
+    except FileNotFoundError:
+        raise PrepError(f"prep 파일이 없습니다: {prep_dir / 'train.txt'}") from None
+
+    item_reviews, found = {}, 0
+    try:
+        with open(prep_dir / "interactions.jsonl", encoding="utf-8") as f:
+            for line in f:
+                row = json.loads(line)
+                u, i = row["user_idx"], row["item_idx"]
+                if (u, i) in train:
+                    found += 1
+                    item_reviews.setdefault(i, []).append((u, [r["text"] for r in row["reviews"]]))
+    except FileNotFoundError:
+        raise PrepError(f"prep 파일이 없습니다: {prep_dir / 'interactions.jsonl'}") from None
+    if found != len(train):
+        raise PrepError(f"interactions.jsonl: train 쌍 {len(train) - found}개가 없습니다")
+
+    return Prep(meta=meta,
+                item_ids=[r["item_id"] for r in items], item_names=[r["name"] for r in items],
+                aux_names=[r["name"] for r in auxs], user_ids=[r["user_id"] for r in users],
+                relations=relations, kg=kg, item_reviews=item_reviews)
+
+
 # ---------------------------------------------------------------- run
 
 @dataclass(frozen=True)
@@ -128,7 +246,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def main(argv=None) -> int:
-    """Exit codes: 0 success, 2 config error, 3 output / tracking error."""
+    """Exit codes: 0 success, 2 config error, 3 prep / output / tracking error."""
     a = parse_args(argv)
     try:
         run = Run(domain_dir=a.domain_dir, prep_version=a.prep, config_path=a.config, stage=a.stage,
@@ -137,7 +255,11 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"설정 오류: {e}")
         return 2
-    STAGE_RUNNERS[run.stage](run)
+    try:
+        STAGE_RUNNERS[run.stage](run)
+    except PrepError as e:
+        print(f"prep 오류: {e}")
+        return 3
     return 0
 
 
