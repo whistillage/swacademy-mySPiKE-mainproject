@@ -7,18 +7,30 @@
 The command line takes only paths and the stage; every other setting lives in the config file
 (design chapter 9). The output folder name is <prep version>_<config file name> (design 8.1).
 
-Implemented stages: none yet (item_raw is being added).
+Implemented stages: item_raw.
+
+Output (design chapter 8):
+    profile/<version>_<method>/raw/item_raw_profiles.jsonl   {"item_idx", "item_id", "text"} per line
+    profile/<version>_<method>/meta.json                     prep hash, per-stage config / inputs / stats
+    profile/<version>_<method>/profile.log                   progress lines
+
+A finished stage (its output file exists) is skipped after checking it still matches the prep,
+the config keys it used and its input files; the code never deletes anything (design chapter 10).
 
 Standard library only (Python 3.10+) for the raw-profile stages.
 """
 
 import argparse
 import csv
+import hashlib
 import json
+import math
 import random
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -300,6 +312,161 @@ def build_item_raw_profiles(prep: Prep, seed: int, review_cap: int) -> list:
     return [item_raw_profile(prep, i, forward[i], reverse[i], seed, review_cap) for i in range(prep.n_items)]
 
 
+# ---------------------------------------------------------------- output and tracking
+
+class TrackingError(Exception):
+    """The profile folder does not match the current prep / config / files (exit code 3)."""
+
+
+# Config keys each stage depends on. Only these are recorded and compared for the stage, so adding
+# keys for later stages to the config file does not invalidate finished stages.
+STAGE_CONFIG_KEYS = {
+    "item_raw": ("seed", "item_review_cap"),
+}
+
+ITEM_RAW_INPUTS = ("item_list.csv", "aux_list.csv", "user_list.csv", "relation_list.csv", "kg.csv",
+                   "train.txt", "interactions.jsonl")
+ITEM_RAW_FILE = Path("raw") / "item_raw_profiles.jsonl"
+
+
+def file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
+def now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git_info() -> dict:
+    """Commit of this code and whether it has uncommitted changes; None when git is not available."""
+    repo = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+                                check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True,
+                               check=True).stdout.strip() != ""
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_commit": None, "git_dirty": None}
+    return {"git_commit": commit, "git_dirty": dirty}
+
+
+def percentiles(values: list) -> dict:
+    """Nearest-rank median / 90% / 99% / max of a non-empty list."""
+    v = sorted(values)
+    at = lambda q: v[max(0, math.ceil(q * len(v)) - 1)]
+    return {"median": at(0.5), "p90": at(0.9), "p99": at(0.99), "max": v[-1]}
+
+
+def write_atomic(path: Path, text: str):
+    """Write to a temporary file next to `path`, then rename: `path` is never half-written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    tmp.replace(path)
+
+
+class Log:
+    """Progress lines on the screen and in profile.log (design 6.6)."""
+
+    def __init__(self, path: Path, stage: str):
+        self.path, self.stage = path, stage
+
+    def __call__(self, message: str):
+        print(f"[{self.stage}] {message}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(f"{now()} [{self.stage}] {message}\n")
+
+
+def open_meta(run: "Run") -> dict:
+    """Read profile meta.json, or start a new one. Stops when the prep it was made from changed
+    (design chapter 10): a new prep version gets a new folder; the same version must not change."""
+    prep_hash = file_hash(run.prep_dir / "meta.json")
+    path = run.out_dir / "meta.json"
+    if not path.exists():
+        return {"domain": run.domain_dir.name, "prep_version": run.prep_version, "prep_meta_sha256": prep_hash,
+                "config_file": run.config_path.name, "stages": {}}
+    with open(path, encoding="utf-8") as f:
+        meta = json.load(f)
+    if meta.get("prep_meta_sha256") != prep_hash:
+        raise TrackingError(f"prep이 바뀌었습니다: {run.prep_dir / 'meta.json'}의 해시가 {path}의 기록과 다릅니다. "
+                            f"새 prep이면 새 버전으로 만들고 그 버전으로 실행하세요")
+    return meta
+
+
+def save_meta(run: "Run", meta: dict):
+    write_atomic(run.out_dir / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+
+
+def check_finished_stage(stage: str, record, config: dict, inputs: dict, output: Path):
+    """Design chapter 10: a finished stage is skipped only if it still matches what it was made from."""
+    if not record or record.get("status") != "done":
+        raise TrackingError(f"{output}이 있지만 meta.json에 {stage} 완료 기록이 없습니다 "
+                            f"(실행이 중간에 끊긴 것으로 보입니다). 파일을 지우고 다시 실행하세요")
+    problems = []
+    for key in sorted(set(config) | set(record.get("config", {}))):
+        if record["config"].get(key) != config.get(key):
+            problems.append(f"설정 {key}: 기록 {record['config'].get(key)!r}, 지금 {config.get(key)!r}")
+    for name in sorted(set(inputs) | set(record.get("inputs", {}))):
+        if record["inputs"].get(name) != inputs.get(name):
+            problems.append(f"입력 파일 {name}의 해시가 다릅니다")
+    if record.get("output") != file_hash(output):
+        problems.append(f"출력 파일 {output.name}이 기록 이후 바뀌었습니다")
+    if problems:
+        raise TrackingError(f"{stage}이 이미 있지만 지금과 맞지 않습니다:\n  - " + "\n  - ".join(problems) +
+                            "\n설정을 바꾸려면 새 이름의 설정 파일을 만들고, 다시 만들려면 출력 파일을 직접 지우세요")
+
+
+def item_raw_stats(prep: Prep, texts: list, review_cap: int) -> dict:
+    used = [min(len(review_units(prep, i)), review_cap) for i in range(prep.n_items)]
+    return {
+        "items_without_reviews": sum(1 for n in used if n == 0),
+        "reviews_used": sum(used),
+        "reviews_per_item": percentiles(used),
+        "words": percentiles([len(t.split()) for t in texts]),
+    }
+
+
+def run_item_raw(run: "Run"):
+    """Stage item_raw: prep -> raw/item_raw_profiles.jsonl, recorded in meta.json."""
+    stage, output = "item_raw", run.out_dir / ITEM_RAW_FILE
+    log = Log(run.out_dir / "profile.log", stage)
+    meta = open_meta(run)
+    config = {k: run.settings.as_dict()[k] for k in STAGE_CONFIG_KEYS[stage]}
+    inputs = {f"prep/{run.prep_version}/{name}": file_hash(run.prep_dir / name) for name in ITEM_RAW_INPUTS}
+
+    if output.exists():
+        check_finished_stage(stage, meta["stages"].get(stage), config, inputs, output)
+        log(f"이미 완료되어 건너뜁니다: {output}")
+        return
+
+    record = {"status": "incomplete", "started": now(), "finished": None, "config": config, "inputs": inputs,
+              "env": git_info()}
+    meta["stages"][stage] = record
+    save_meta(run, meta)
+    log(f"시작: {run.prep_dir} -> {output}")
+
+    prep = load_prep(run.prep_dir)
+    texts = build_item_raw_profiles(prep, run.settings.seed, run.settings.item_review_cap)
+    write_atomic(output, "".join(
+        json.dumps({"item_idx": i, "item_id": prep.item_ids[i], "text": t}, ensure_ascii=False) + "\n"
+        for i, t in enumerate(texts)))
+
+    stats = item_raw_stats(prep, texts, run.settings.item_review_cap)
+    record.update(status="done", finished=now(), count=len(texts), output=file_hash(output), stats=stats)
+    save_meta(run, meta)
+    log(f"완료: {len(texts):,}개, 리뷰 없는 아이템 {stats['items_without_reviews']:,}개, "
+        f"단어 수 중앙값 {stats['words']['median']:,} / 최대 {stats['words']['max']:,}")
+
+
+STAGE_RUNNERS["item_raw"] = run_item_raw
+
+
 # ---------------------------------------------------------------- run
 
 @dataclass(frozen=True)
@@ -362,6 +529,9 @@ def main(argv=None) -> int:
         STAGE_RUNNERS[run.stage](run)
     except PrepError as e:
         print(f"prep 오류: {e}")
+        return 3
+    except TrackingError as e:
+        print(f"추적 오류: {e}")
         return 3
     return 0
 

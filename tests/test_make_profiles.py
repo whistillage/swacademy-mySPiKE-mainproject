@@ -424,3 +424,135 @@ def test_item_raw_empty_profile_is_prep_error():
     p = small_prep([REL_AUTHOR], ["W"])
     with pytest.raises(mp.PrepError, match="I0"):
         mp.build_item_raw_profiles(p, 2020, 5)
+
+
+# ---------------------------------------------------------------- output and tracking
+
+def run_cli(domain: Path, config: Path, stage="item_raw") -> int:
+    return mp.main([str(domain), "--prep", "v1", "--config", str(config), "--stage", stage])
+
+
+@pytest.fixture
+def toy_run(toy_prep, tmp_path):
+    """(domain folder, config path, profile folder) for a CLI run on the toy prep."""
+    config = write_config(tmp_path / "configs" / "qwen3-4b.json", GOOD)
+    domain = toy_prep.parent.parent
+    return domain, config, domain / "profile" / "v1_qwen3-4b"
+
+
+def read_meta(out: Path) -> dict:
+    return json.loads((out / "meta.json").read_text(encoding="utf-8"))
+
+
+def test_item_raw_cli_writes_profiles_and_meta(toy_run, capsys):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    lines = (out / "raw" / "item_raw_profiles.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(l) for l in lines]
+    expected = mp.build_item_raw_profiles(mp.load_prep(domain / "prep" / "v1"), 2020, 5)
+    assert rows == [{"item_idx": i, "item_id": f"I{i + 1}", "text": t} for i, t in enumerate(expected)]
+
+    meta = read_meta(out)
+    assert meta["domain"] == "toy" and meta["prep_version"] == "v1" and meta["config_file"] == "qwen3-4b.json"
+    assert meta["prep_meta_sha256"] == mp.file_hash(domain / "prep" / "v1" / "meta.json")
+    rec = meta["stages"]["item_raw"]
+    assert rec["status"] == "done" and rec["count"] == 4 and rec["started"] and rec["finished"]
+    assert rec["config"] == {"seed": 2020, "item_review_cap": 5}
+    assert sorted(rec["inputs"]) == sorted(f"prep/v1/{n}" for n in mp.ITEM_RAW_INPUTS)
+    assert rec["output"] == mp.file_hash(out / "raw" / "item_raw_profiles.jsonl")
+    assert set(rec["env"]) == {"git_commit", "git_dirty"}
+    assert rec["stats"]["items_without_reviews"] == 1
+    assert rec["stats"]["reviews_used"] == 5                     # 0 + 1 + 3 + 1
+    assert rec["stats"]["reviews_per_item"] == {"median": 1, "p90": 3, "p99": 3, "max": 3}
+    assert rec["stats"]["words"]["max"] == max(len(t.split()) for t in expected)
+
+    log = (out / "profile.log").read_text(encoding="utf-8")
+    assert "[item_raw] 시작" in log and "[item_raw] 완료: 4개" in log
+    assert not list(out.rglob("*.tmp"))
+    assert "완료: 4개" in capsys.readouterr().out
+
+
+def test_item_raw_rerun_skips(toy_run, capsys):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    before = (out / "raw" / "item_raw_profiles.jsonl").read_bytes(), read_meta(out)
+    assert run_cli(domain, config) == 0
+    assert "이미 완료되어 건너뜁니다" in capsys.readouterr().out
+    assert ((out / "raw" / "item_raw_profiles.jsonl").read_bytes(), read_meta(out)) == before
+
+
+def test_item_raw_deleted_output_is_rebuilt_identically(toy_run):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    first = (out / "raw" / "item_raw_profiles.jsonl").read_bytes()
+    (out / "raw" / "item_raw_profiles.jsonl").unlink()
+    assert run_cli(domain, config) == 0
+    assert (out / "raw" / "item_raw_profiles.jsonl").read_bytes() == first
+
+
+def test_item_raw_config_change_stops(toy_run, capsys):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    write_config(config, {**GOOD, "item_review_cap": 3})
+    assert run_cli(domain, config) == 3
+    assert "설정 item_review_cap: 기록 5, 지금 3" in capsys.readouterr().out
+
+
+def test_item_raw_prep_change_stops(toy_run, capsys):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    edit(domain / "prep" / "v1" / "meta.json", lambda s: s + "\n")
+    assert run_cli(domain, config) == 3
+    assert "prep이 바뀌었습니다" in capsys.readouterr().out
+
+
+def test_item_raw_input_change_stops(toy_run, capsys):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    edit(domain / "prep" / "v1" / "kg.csv", lambda s: s + "\n")
+    assert run_cli(domain, config) == 3
+    assert "입력 파일 prep/v1/kg.csv의 해시가 다릅니다" in capsys.readouterr().out
+
+
+def test_item_raw_edited_output_stops(toy_run, capsys):
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    edit(out / "raw" / "item_raw_profiles.jsonl", lambda s: s.replace("Book One", "Book 1"))
+    assert run_cli(domain, config) == 3
+    assert "기록 이후 바뀌었습니다" in capsys.readouterr().out
+
+
+def test_item_raw_output_without_done_record_stops(toy_run, capsys):
+    """Interrupted between the rename of the output and the final meta.json write."""
+    domain, config, out = toy_run
+    assert run_cli(domain, config) == 0
+    meta = read_meta(out)
+    meta["stages"]["item_raw"]["status"] = "incomplete"
+    (out / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert run_cli(domain, config) == 3
+    assert "완료 기록이 없습니다" in capsys.readouterr().out
+
+
+def test_other_config_name_gets_its_own_folder(toy_run):
+    domain, config, out = toy_run
+    other = write_config(config.parent / "qwen3-4b-cap3.json", {**GOOD, "item_review_cap": 3})
+    assert run_cli(domain, config) == 0 and run_cli(domain, other) == 0
+    assert read_meta(domain / "profile" / "v1_qwen3-4b-cap3")["stages"]["item_raw"]["config"]["item_review_cap"] == 3
+    assert read_meta(out)["stages"]["item_raw"]["config"]["item_review_cap"] == 5
+
+
+def test_git_info_without_git(monkeypatch):
+    def fail(*a, **k):
+        raise OSError("no git")
+    monkeypatch.setattr(mp.subprocess, "run", fail)
+    assert mp.git_info() == {"git_commit": None, "git_dirty": None}
+
+
+def test_git_info_in_repo():
+    info = mp.git_info()
+    assert len(info["git_commit"]) == 40 and isinstance(info["git_dirty"], bool)
+
+
+def test_percentiles():
+    assert mp.percentiles([5]) == {"median": 5, "p90": 5, "p99": 5, "max": 5}
+    assert mp.percentiles(list(range(1, 101))) == {"median": 50, "p90": 90, "p99": 99, "max": 100}
