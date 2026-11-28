@@ -8,17 +8,18 @@ Example:
 Reads (author format, read only):
     user_list.txt, item_list.txt, entity_list.txt, relation_list.txt,
     interaction_list.txt, review_list.txt, kg_final.txt
-Writes (data spec v1.2):
+Writes (data spec v1.4):
     interactions.jsonl, items.csv, auxs.csv, kg.csv, relations.csv
 
-Conversion rules (preprocessing design doc, section 10.1):
+Conversion rules (preprocessing implementation report, section 5.1):
 - IDs go back to the original strings (user ID, ASIN, DBpedia-style entity ID).
 - Item names come from item_list's dbpedia_id: drop "res:", "_" -> " ".
 - Aux = entities after the items. name: drop "cat:"/"res:", "_" -> " ".
   aux_type by prefix: cat: -> category, res: -> resource, URL -> url.
 - kg_final is kept as is, including its exact duplicate rows (validation warns,
   preprocessing removes them). All triples are item -> aux.
-- Empty reviews (5 in the author data) are filled with EMPTY_REVIEW_PLACEHOLDER.
+- Empty reviews (5 in the author data) are filled with EMPTY_REVIEW_PLACEHOLDER. The spec says to
+  drop such rows; they are kept here to reproduce the author's counts (report 5.1).
 - The author data has no timestamp / rating, so those optional columns are omitted.
 
 Standard library only.

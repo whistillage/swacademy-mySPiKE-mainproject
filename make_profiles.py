@@ -1,4 +1,4 @@
-"""Build profiles from a prep version: prep/<version>/ -> profile/<version>_<method>/ (LLM profile design v1.0).
+"""Build profiles from a prep version: prep/<version>/ -> profile/<version>_<method>/ (LLM profile design v1.1).
 
     python make_profiles.py data/<domain> --prep v1 --config configs/profile/<method>.json --stage <stage>
 

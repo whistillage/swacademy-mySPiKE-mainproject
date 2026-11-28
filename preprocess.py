@@ -1,4 +1,4 @@
-"""Preprocess a domain dataset: raw/ -> prep/<version>/ (preprocessing design v1.5).
+"""Preprocess a domain dataset: raw/ -> prep/<version>/ (preprocessing design v1.10).
 
     python preprocess.py data/<domain> --version v1 [--seed 2020] [--split 0.7 0.1 0.2]
                          [--user-min 5] [--item-min 1]

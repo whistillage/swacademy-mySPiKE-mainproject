@@ -1,4 +1,4 @@
-"""Validate a domain dataset submission (data spec v1.4, preprocessing design v1.2 section 4.2).
+"""Validate a domain dataset submission (data spec v1.4, preprocessing design v1.10 section 4.2).
 
     python validate_dataset.py data/<domain>/raw [--json report.json] [--examples 5]
 
